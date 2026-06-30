@@ -405,3 +405,561 @@ Rules are applied in priority order — later rules override earlier ones:
 - [MQL4 Reference — CopyRates](https://docs.mql4.com/series/copyrates)
 - [MQL5 Article — Analyzing Candlestick Patterns](https://www.mql5.com/en/articles/101)
 - [MQL4 Reference — ENUM_TIMEFRAMES](https://docs.mql4.com/constants/chartconstants/enum_timeframes)
+
+
+---
+
+## PPM Efficiency Indicator
+
+### Overview
+
+The **Pip Per Minute (PPM) Efficiency Indicator** is a supplementary tool designed to measure market movement efficiency by calculating the ratio of price distance (in pips) to time duration (in minutes). This indicator helps identify high-quality scalping opportunities by filtering for movements that achieve optimal efficiency thresholds.
+
+**Core Formula:**
+```
+PPM = Distance (pips) / Duration (minutes)
+```
+
+**Strategic Objectives:**
+- Filter for high-efficiency movements (≥1.5 PPM minimum, ≥2.0 PPM optimal)
+- Minimize time-based price risk through short exposure periods (30 seconds to 2.5 minutes)
+- Identify 100-150 quality trading opportunities per day from approximately 600 total market movements
+- Utilize M1 timeframe with Zigzag indicator (2-2-1 configuration) for precise swing detection
+
+### Key Features
+
+1. **Efficiency-Based Filtering** - Quantifies trade quality through mathematical precision
+2. **Time Risk Management** - Short exposure reduces directional market risk
+3. **Visual Feedback** - Real-time PPM values displayed directly on chart
+4. **Configurable Parameters** - Input-driven design allows threshold customization
+5. **Broker-Agnostic** - Automatically adjusts for 3/4/5-digit broker configurations
+6. **Resource Optimized** - Automatic cleanup of old labels and memory management
+
+---
+
+## Detailed Dataflow Descriptions
+
+### 1. Initialization Dataflow
+
+**Description:** The indicator initialization phase establishes buffer structures, configures visual properties, and prepares the calculation engine.
+
+```mermaid
+graph TD
+    A[OnInit Called] --> B[Allocate Index Buffers]
+    B --> C[Set Buffer Properties]
+    C --> C1[ZigzagBuffer: DRAW_SECTION]
+    C --> C2[PPMBuffer: DRAW_NONE]
+    C1 --> D[Set Empty Values]
+    C2 --> D
+    D --> E[Configure Array Series]
+    E --> F[Set Indicator Labels]
+    F --> G[Return INIT_SUCCEEDED]
+    
+    style A fill:#e1f5ff
+    style G fill:#c8e6c9
+```
+
+**Key Operations:**
+- Buffer 0 (ZigzagBuffer): Visual representation of swing points
+- Buffer 1 (PPMBuffer): Stores calculated PPM values for each swing
+- Empty value set to 0.0 to distinguish valid data from uninitialized bars
+- Array series configuration ensures proper indexing (newest bar = index 0)
+
+---
+
+### 2. Price Data Acquisition Dataflow
+
+**Description:** On each tick, the indicator receives time-series data from the MT4 platform and prepares arrays for processing.
+
+```mermaid
+graph LR
+    A[OnCalculate Triggered] --> B{Sufficient Bars?}
+    B -->|No| C[Return 0]
+    B -->|Yes| D[Set Arrays as Series]
+    D --> E[time[] array]
+    D --> F[high[] array]
+    D --> G[low[] array]
+    E --> H[Validate Data]
+    F --> H
+    G --> H
+    H --> I[Proceed to Zigzag]
+    
+    style A fill:#fff9c4
+    style I fill:#c8e6c9
+    style C fill:#ffcdd2
+```
+
+**Validation Checks:**
+- Minimum bars: `InpDepth + InpBackstep` required for Zigzag calculation
+- Array series flag ensures consistent indexing across all time series
+- Data integrity verification before proceeding to calculations
+
+---
+
+### 3. Zigzag Calculation Dataflow
+
+**Description:** Utilizes MT4's built-in Zigzag indicator to identify swing high and swing low points in the market.
+
+```mermaid
+graph TD
+    A[Loop Through Bars] --> B[Call iCustom ZigZag]
+    B --> C{ZigZag Value Valid?}
+    C -->|No/Empty| D[Set Buffer to 0.0]
+    C -->|Yes| E[Store in ZigzagBuffer]
+    E --> F{Previous Swing Exists?}
+    F -->|No| G[Save as First Swing]
+    F -->|Yes| H[Calculate PPM]
+    G --> I[Continue Loop]
+    D --> I
+    H --> J[Store in PPMBuffer]
+    J --> I
+    I --> K{More Bars?}
+    K -->|Yes| A
+    K -->|No| L[Complete]
+    
+    style A fill:#e1f5ff
+    style L fill:#c8e6c9
+```
+
+**Zigzag Parameters:**
+- **Depth (2):** Minimum number of bars for high/low reversal detection
+- **Deviation (2):** Minimum price change (in points) required for new swing
+- **Backstep (1):** Bars to skip after detecting a swing to avoid false signals
+
+---
+
+### 4. PPM Calculation Dataflow
+
+**Description:** Measures efficiency by computing the pip-per-minute ratio between consecutive swing points.
+
+```mermaid
+graph TD
+    A[Swing Point Detected] --> B[Calculate Price Distance]
+    B --> C[Get Previous Swing Price]
+    C --> D[Compute Absolute Difference]
+    D --> E[Normalize to Pips]
+    E --> E1{Broker Digits?}
+    E1 -->|3 or 5 digits| E2[Point * 10]
+    E1 -->|4 digits| E3[Point * 1]
+    E2 --> F[Calculate Time Duration]
+    E3 --> F
+    F --> G[time_current - time_previous]
+    G --> H[Convert to Minutes]
+    H --> I{Duration > 0?}
+    I -->|Yes| J[PPM = Pips / Minutes]
+    I -->|No| K[Skip Calculation]
+    J --> L[Store PPM Value]
+    K --> M[Continue]
+    L --> M
+    
+    style A fill:#fff9c4
+    style J fill:#4caf50
+    style L fill:#c8e6c9
+```
+
+**Calculation Formula:**
+```mql4
+double pips = NormalizePips(priceDist);
+int minutes = (int)((time[prevBar] - time[currentBar]) / 60);
+if (minutes > 0) {
+    ppm = pips / minutes;
+}
+```
+
+---
+
+### 5. Efficiency Filtering Dataflow
+
+**Description:** Applies threshold filters to identify and display only high-efficiency trading opportunities.
+
+```mermaid
+graph TD
+    A[PPM Calculated] --> B{PPM >= InpMinPPM?}
+    B -->|No| C[Skip Display]
+    B -->|Yes| D{InpShowLabels Enabled?}
+    D -->|No| E[Store Internally Only]
+    D -->|Yes| F[Create Label Object]
+    C --> G[Continue]
+    E --> G
+    F --> H{PPM >= InpTargetPPM?}
+    H -->|Yes| I[Color: Yellow]
+    H -->|No| J[Color: White]
+    I --> K[Display on Chart]
+    J --> K
+    K --> G
+    
+    style B fill:#fff9c4
+    style I fill:#ffeb3b
+    style J fill:#f5f5f5
+    style K fill:#c8e6c9
+```
+
+**Threshold Levels:**
+- **1.5 PPM:** Minimum entry requirement (~150 opportunities/day)
+- **2.0 PPM:** Optimal efficiency target (~100 opportunities/day)
+- Color coding provides instant visual identification of trade quality
+
+---
+
+### 6. Label Management Dataflow
+
+**Description:** Manages chart objects to display PPM values while preventing memory leaks and visual clutter.
+
+```mermaid
+graph TD
+    A[Create/Update Label] --> B{Object Exists?}
+    B -->|Yes| C[Update Properties]
+    B -->|No| D[Create New Object]
+    D --> E[Set Position]
+    C --> F[Set Text]
+    E --> F
+    F --> G[Set Color]
+    G --> H[Set Font Size]
+    H --> I[Set Selectable: False]
+    I --> J[Label Active]
+    J --> K{Cleanup Timer?}
+    K -->|Yes| L[Check Label Age]
+    K -->|No| M[Continue]
+    L --> N{Age > 7 Days?}
+    N -->|Yes| O[Delete Label]
+    N -->|No| M
+    O --> M
+    
+    style A fill:#e1f5ff
+    style J fill:#c8e6c9
+    style O fill:#ffcdd2
+```
+
+**Resource Management:**
+- Hourly cleanup cycle removes labels older than 7 days from visible range
+- Object name convention: `PPM_[timestamp]` for unique identification
+- `OnDeinit()` ensures complete cleanup when indicator is removed
+
+---
+
+### 7. Complete System Dataflow
+
+**Description:** End-to-end flow showing how data moves through the entire PPM indicator system.
+
+```mermaid
+graph TB
+    A[Market Tick] --> B[OnCalculate]
+    B --> C[Validate Data]
+    C --> D[Zigzag Detection]
+    D --> E{Swing Point?}
+    E -->|No| F[No Action]
+    E -->|Yes| G[Calculate PPM]
+    G --> H[Apply Filters]
+    H --> I{Meets Criteria?}
+    I -->|No| J[Store Only]
+    I -->|Yes| K[Create Label]
+    K --> L[Display on Chart]
+    J --> M[Update Buffers]
+    L --> M
+    M --> N[Return rates_total]
+    N --> O{Cleanup Due?}
+    O -->|Yes| P[Remove Old Labels]
+    O -->|No| Q[Wait Next Tick]
+    P --> Q
+    F --> Q
+    
+    subgraph Initialization
+    Z[OnInit] --> B
+    end
+    
+    subgraph Termination
+    Q -.-> R[OnDeinit]
+    R --> S[Cleanup All Labels]
+    end
+    
+    style A fill:#e3f2fd
+    style K fill:#fff9c4
+    style L fill:#c8e6c9
+    style S fill:#ffcdd2
+```
+
+---
+
+## User Guide
+
+### Installation
+
+#### Step 1: Download the Indicator
+1. Navigate to the repository: `https://github.com/nhasibuan/oneminuteman`
+2. Download `PPMEfficiency.mq4` file
+3. Save to your computer
+
+#### Step 2: Install in MetaTrader 4
+1. Open MT4 platform
+2. Click **File** → **Open Data Folder**
+3. Navigate to `MQL4` → `Indicators`
+4. Copy `PPMEfficiency.mq4` into this folder
+5. Restart MT4 or right-click Navigator panel → **Refresh**
+
+#### Step 3: Verify Installation
+1. Open Navigator panel (Ctrl+N)
+2. Expand **Indicators** → **Custom**
+3. Locate **PPMEfficiency** in the list
+
+---
+
+### Configuration
+
+#### Adding to Chart
+1. Open an M1 (1-minute) chart for your preferred symbol (e.g., EURUSD, XAUUSD)
+2. Drag **PPMEfficiency** from Navigator to the chart
+3. Configuration dialog will appear
+
+#### Parameter Settings
+
+**Zigzag Configuration:**
+```
+InpDepth      = 2   // Minimum bars for reversal detection
+InpDeviation  = 2   // Minimum price change in points
+InpBackstep   = 1   // Bars to skip after swing detection
+```
+
+**PPM Thresholds:**
+```
+InpMinPPM     = 1.5   // Minimum efficiency for display (1.5 = ~150 opportunities/day)
+InpTargetPPM  = 2.0   // Target efficiency for highlighting (2.0 = ~100 opportunities/day)
+```
+
+**Visual Settings:**
+```
+InpShowLabels    = true        // Display PPM values on chart
+InpLowPPMColor   = clrWhite    // Color for 1.5-2.0 PPM range
+InpHighPPMColor  = clrYellow   // Color for >=2.0 PPM (optimal)
+```
+
+#### Recommended Configurations
+
+**Conservative (More Opportunities):**
+- InpMinPPM = 1.5
+- InpTargetPPM = 2.0
+- Expect: 150 signals per day
+
+**Aggressive (Higher Quality):**
+- InpMinPPM = 2.0
+- InpTargetPPM = 2.5
+- Expect: 100 signals per day
+
+**Ultra-Selective (Premium Only):**
+- InpMinPPM = 2.5
+- InpTargetPPM = 3.0
+- Expect: 50-70 signals per day
+
+---
+
+### Usage Instructions
+
+#### 1. Chart Setup
+- **Timeframe:** M1 (1-minute) - CRITICAL requirement
+- **Symbol:** Any forex pair or instrument (EURUSD, GBPUSD, XAUUSD recommended)
+- **Chart Type:** Candlestick recommended for visual confirmation
+
+#### 2. Interpreting Signals
+
+**Visual Elements:**
+- **Red Zigzag Lines:** Connect swing high and swing low points
+- **White Numbers:** PPM values between 1.5-2.0 (acceptable efficiency)
+- **Yellow Numbers:** PPM values ≥2.0 (optimal efficiency - priority targets)
+
+**Signal Quality Assessment:**
+```
+PPM < 1.5  : Low efficiency - AVOID
+PPM 1.5-2.0: Acceptable - Consider with confirmation
+PPM ≥ 2.0  : High efficiency - PRIORITY targets
+PPM ≥ 3.0  : Exceptional - Rare premium opportunities
+```
+
+#### 3. Entry Strategy
+
+When a new swing point is detected with qualifying PPM:
+
+**Step 1: Validate Efficiency**
+- Check PPM value is ≥ InpMinPPM threshold
+- Yellow labels indicate optimal targets
+
+**Step 2: Confirm Direction**
+- Swing high with high PPM = potential SHORT entry
+- Swing low with high PPM = potential LONG entry
+
+**Step 3: Time Management**
+- Target duration: 30 seconds to 2.5 minutes
+- Exit if efficiency drops (PPM falls below threshold)
+- Use OneMinuteMan EA for execution and pattern confirmation
+
+#### 4. Risk Management
+
+**Position Sizing:**
+- Keep lot sizes small for M1 scalping
+- Maximum 1-2% account risk per trade
+- Consider spread costs in profit calculations
+
+**Stop Loss Guidelines:**
+- Place stop beyond the previous swing point
+- Typical range: 5-10 pips for major pairs
+- Adjust for symbol volatility (XAUUSD may require wider stops)
+
+**Take Profit Targets:**
+- Conservative: 3-5 pips
+- Moderate: 5-8 pips
+- Aggressive: 8-12 pips
+- Always consider PPM value - higher PPM allows tighter targets
+
+---
+
+### Troubleshooting
+
+#### Issue: No PPM Labels Displayed
+
+**Solutions:**
+1. Verify `InpShowLabels = true`
+2. Check that chart is M1 timeframe
+3. Lower `InpMinPPM` threshold to see more signals
+4. Ensure sufficient historical data loaded (minimum 500 bars)
+
+#### Issue: Too Many Labels (Chart Clutter)
+
+**Solutions:**
+1. Increase `InpMinPPM` threshold (try 2.0 or higher)
+2. Set `InpShowLabels = false` to hide labels
+3. Zoom out chart to see fewer bars
+4. Wait for automatic cleanup cycle (runs hourly)
+
+#### Issue: Indicator Not Calculating
+
+**Solutions:**
+1. Check for compilation errors: Open MetaEditor → Compile `PPMEfficiency.mq4`
+2. Verify `#property strict` is enabled
+3. Ensure standard Zigzag indicator is available in MT4
+4. Check Journal tab for error messages
+
+#### Issue: PPM Values Seem Incorrect
+
+**Solutions:**
+1. Verify broker digit configuration (3/4/5 digits)
+2. Check Zigzag parameters match source specification (2-2-1)
+3. Ensure time array is properly set as series
+4. Validate that sufficient bars are available for calculation
+
+---
+
+### Best Practices
+
+#### Optimal Trading Conditions
+- **Time Sessions:** London/NY overlap (12:00-16:00 GMT) for highest liquidity
+- **Avoid:** Major news releases (NFP, FOMC, GDP) - volatility skews PPM
+- **Spread Awareness:** Trade during low-spread hours to maximize profit potential
+
+#### Combining with OneMinuteMan EA
+The PPM Efficiency Indicator complements the OneMinuteMan EA:
+
+1. **PPM Indicator:** Identifies high-efficiency swing points
+2. **OneMinuteMan EA:** Validates candlestick patterns and executes trades
+3. **Combined Strategy:** Only trade OneMinuteMan signals that occur at high PPM swing points
+
+#### Performance Monitoring
+- Log PPM values daily to establish symbol-specific norms
+- Track win rate by PPM threshold (1.5-2.0 vs ≥2.0)
+- Adjust `InpMinPPM` based on 30-day statistical analysis
+- Monitor execution speed - slippage can negate PPM advantages
+
+#### Broker Compatibility
+- Verify broker allows M1 scalping without restrictions
+- Test with demo account for minimum 2 weeks
+- Confirm execution quality meets PPM time requirements
+- Check that broker spread remains stable during trading hours
+
+---
+
+### Advanced Usage
+
+#### Multi-Symbol Monitoring
+1. Open multiple M1 charts (EURUSD, GBPUSD, USDJPY, XAUUSD)
+2. Apply PPMEfficiency to each chart with same settings
+3. Focus on symbols showing highest PPM values (yellow labels)
+4. Trade the most efficient opportunities across all symbols
+
+#### Alert Integration (Future Enhancement)
+For developers wanting to add alerts:
+
+```mql4
+if(ppm >= InpTargetPPM) {
+    string alertMsg = "High PPM Detected: " + DoubleToStr(ppm, 2) + 
+                      " on " + Symbol() + " M1";
+    Alert(alertMsg);
+    SendNotification(alertMsg);  // Mobile notification
+}
+```
+
+#### Export PPM Data for Analysis
+PPM values stored in `PPMBuffer[]` can be accessed by:
+- Custom Expert Advisors via `iCustom()` function
+- Exported to CSV for statistical analysis
+- Used in machine learning models for pattern recognition
+
+---
+
+### Frequently Asked Questions
+
+**Q: Can I use PPM Indicator on M5 or H1 charts?**
+A: Not recommended. The PPM strategy is specifically designed for M1 charts. Higher timeframes dilute the PPM values, making it impossible to achieve the 2.0 target due to increased time duration.
+
+**Q: How many trades should I expect per day?**
+A: Approximately 100-150 opportunities with InpMinPPM = 1.5, and 50-100 with InpMinPPM = 2.0. Actual count varies by symbol volatility and market conditions.
+
+**Q: Does PPM Indicator generate trade signals?**
+A: No, it's an analytical tool that measures efficiency. It identifies high-quality swing points but does not generate entry/exit signals. Use with OneMinuteMan EA for complete strategy.
+
+**Q: What's the difference between white and yellow labels?**
+A: White labels show PPM between 1.5-2.0 (acceptable efficiency), yellow labels show PPM ≥2.0 (optimal efficiency - priority targets).
+
+**Q: Why are old labels disappearing?**
+A: Automatic cleanup runs hourly to prevent memory leaks and chart clutter. Labels older than 7 days from the visible chart area are removed.
+
+**Q: Can I backtest with PPM values?**
+A: Yes. PPM values are stored in the indicator buffer and can be accessed by Expert Advisors using `iCustom()` function for historical analysis.
+
+---
+
+### Support and Resources
+
+**Repository:** https://github.com/nhasibuan/oneminuteman
+
+**Issues/Questions:** Submit via GitHub Issues tab
+
+**Documentation:** This README and inline code comments
+
+**License:** MIT License - free for personal and commercial use
+
+---
+
+### Version History
+
+**v5.00** (Current)
+- Initial PPM Efficiency Indicator implementation
+- Integrated with OneMinuteMan EA repository
+- Full dataflow documentation and user guide
+- Broker-agnostic pip normalization
+- Automatic label cleanup and memory management
+
+---
+
+### Credits
+
+**Developer:** Norman Hasibuan (nhasibuan)
+
+**Strategy Concept:** Bionics Trading Algorithms - Pip Per Minute (PPM) methodology
+
+**References:**
+- MQL4 Documentation: https://docs.mql4.com/
+- Zigzag Indicator Analysis: https://www.mql5.com/en/articles/101
+- PPM Trading Theory: NotebookLM Source Analysis
+
+---
+
+## License
+
+MIT License - See LICENSE file for details
