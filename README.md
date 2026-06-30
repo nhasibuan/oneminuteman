@@ -100,7 +100,7 @@ Both engines run concurrently via separate event handlers and expose their resul
 ## Features
 
 - Rolling 1-minute high/low with sub-second resolution (configurable down to 10 ms)
-- 9-pattern single-bar candlestick engine: Doji, Hammer, Inverted Hammer, Marubozu, Marubozu Long, Spinning Top, Short, Long, Star (reserved)
+- 9-pattern single-bar candlestick engine: Doji, Hammer, Inverted Hammer, Marubozu, Long, Short, Spinning Top, Star (reserved)
 - Trend classification per bar: Ascending / Descending / Lateral (SMA-based)
 - Circular buffer — O(1) write, no array shifting
 - Live dual-panel `Comment()` overlay — range block + candle block
@@ -113,169 +113,173 @@ Both engines run concurrently via separate event handlers and expose their resul
 ## Architecture & Blueprint
 
 ```
-oneminuteman_merged.mq4 (374 lines)
-│
-├── [Constants]     BUFFER_SIZE = 1200  (1200 × 50 ms = 60 s)
-├── [Inputs]        InpSampleMs | InpWindowSize | InpAverPeriod
-├── [Enums]         TYPE_CANDLESTICK (9) | TYPE_TREND (3)
-├── [Struct]        CANDLE_STRUCTURE (OHLC + time + trend + bull + bodysize + type)
-├── [Globals]       g_prices[] | g_head | g_count | g_high | g_low
-│                   g_candle | g_candle_valid
-│
-├── Section 1       TFLabel()            — safe timeframe string (strict-mode fix)
-├── Section 2       IsNewBar()           — bar-open guard (static datetime)
-├── Section 3       ScanHighLow()        — O(n) range scan with DBL_MAX sentinels
-├── Section 4       CalcAverageClose()   — SMA for trend baseline
-│                   CalcAverageBody()    — average body for size classification
-│                   CalcShades()         — upper/lower shadow extraction
-│                   RecognizeCandle()    — main 7-rule classification function
-├── Section 5       CandleTypeName()     — enum → string
-│                   TrendName()          — enum → string
-├── Section 6       UpdateComment()      — merged dual-panel chart overlay
-│
-├── OnInit()        validate → allocate → EventSetMillisecondTimer()
-├── OnDeinit()      EventKillTimer() → Comment("")
-├── OnTimer()       sample Ask → write buffer → ScanHighLow → UpdateComment
-└── OnTick()        IsNewBar guard → RecognizeCandle → Print log → trade entry
+oneminuteman.mq4 (212 lines)
+  │
+  ├── [Constants] BUFFER_SIZE = 1202
+  ├── [Inputs] InpSampleMs | InpWindowSize | InpAverPeriod
+  ├── [Enums] TYPE_CANDLESTICK (8) | TYPE_TREND (4)
+  ├── [Struct] CANDLE_STRUCTURE (type + unit + bodysize + shadows + OHLC)
+  ├── [Globals] g_prices[] | g_head | g_count | g_high | g_low | g_candle
+  │
+  ├── Section 1 TFLabel() — safe timeframe string (strict-mode fix)
+  ├── Section 2 IsNewBar() — bar-open guard (static datetime)
+  ├── Section 3 ScanHighLow() — O(n) range scan with DBL_MAX sentinels
+  ├── Section 4 CalcShades() — upper/lower shadow extraction
+  │             CalcAverageClose() — SMA for trend baseline
+  │             CalcAverageBody() — average body for size classification
+  │             RecognizeCandle() — main 7-rule classification function
+  ├── Section 5 CandleTypeName() — enum to string
+  │             TrendName() — enum to string
+  ├── Section 6 UpdateComment() — merged dual-panel chart overlay
+  │
+  ├── OnInit()    validate → allocate → EventSetMillisecondTimer()
+  ├── OnDeinit()  EventKillTimer() → Comment("")
+  ├── OnTimer()   sample Ask → write buffer → ScanHighLow → UpdateComment
+  └── OnTick()    IsNewBar guard → RecognizeCandle → Print log → trade entry
 ```
 
 ---
 
 ## Dataflow
 
-### System Dataflow
+### 1. System Dataflow
 
 ```mermaid
 flowchart TD
-    subgraph MT4["MetaTrader 4 Platform"]
-        BROKER["Broker Feed\n(Ask price)"]
-        TIMER["System Timer\n(every 50 ms)"]
-        TICK["New Tick Event"]
-        BARS["Historical Bars\n(CopyRates / iTime)"]
-    end
-
-    subgraph EA["oneminuteman_merged.mq4"]
-        direction TB
-
-        subgraph RANGE["Range Engine  (OnTimer)"]
-            T1["OnTimer()"]
-            T2["Write Ask →\ng_prices[g_head]"]
-            T3["Advance g_head\n(circular mod)"]
-            T4["ScanHighLow()\nO(n) full scan"]
-            T5["g_high / g_low\nupdated"]
-        end
-
-        subgraph CANDLE["Candle Engine  (OnTick)"]
-            K1["OnTick()"]
-            K2["IsNewBar()\nstatic datetime guard"]
-            K3["RecognizeCandle()\nCopyRates → OHLC"]
-            K4["CalcAverageClose()\nCalcAverageBody()\nCalcShades()"]
-            K5["Classify pattern\n(CAND_* priority chain)"]
-            K6["g_candle\ng_candle_valid"]
-        end
-
-        subgraph DISPLAY["Display"]
-            D1["UpdateComment()\nStringFormat merged panel"]
-            D2["Chart Comment()\nnon-blocking overlay"]
-        end
-
-        subgraph TRADE["Trade Logic Entry"]
-            TR["OnTick() post-guard\ng_high + g_low + g_candle\navailable here"]
-        end
-    end
-
-    BROKER -->|Ask| T1
-    TIMER  -->|fires| T1
-    T1 --> T2 --> T3 --> T4 --> T5
-    T5 --> D1
-
-    TICK   -->|tick event| K1
-    BARS   -->|MqlRates[]| K3
-    K1 --> K2
-    K2 -->|new bar| K3
-    K3 --> K4 --> K5 --> K6
-    K6 --> D1
-    K6 --> TR
-    T5 --> TR
-
-    D1 --> D2
+    Broker[Broker Feed - Ask price] -->|every InpSampleMs ms| Timer[System Timer]
+    Timer --> OnTimer[OnTimer]
+    OnTimer --> Buffer[Write Ask to g_prices at g_head]
+    Buffer --> Advance[Advance g_head circular index]
+    Advance --> Scan[ScanHighLow - update g_high and g_low]
+    
+    Tick[New Tick Event] --> OnTick[OnTick]
+    OnTick --> NewBar{IsNewBar - static datetime guard}
+    NewBar -->|new bar detected| Recognize[RecognizeCandle]
+    Recognize --> Load[Load MqlRates array via CopyRates]
+    Load --> Compute[Compute trend, body size, shadows]
+    Compute --> Rules[Apply 7-rule priority chain]
+    Rules --> Update[Update g_candle]
+    
+    Scan --> Display[UpdateComment]
+    Update --> Display
+    Display --> Chart[Chart Comment - non-blocking overlay]
+    
+    Update --> Trade[Trade Logic Hook]
+    Scan --> Trade
+    Trade -->|g_high, g_low, g_candle available here| Entry[OnTick - entry point for order logic]
 ```
 
-### Circular Buffer Write Sequence
+### 2. Circular Buffer Write Sequence
 
 ```mermaid
 sequenceDiagram
-    participant TMR  as System Timer
-    participant OT   as OnTimer()
-    participant BUF  as g_prices[]
-    participant SCAN as ScanHighLow()
-    participant UI   as Chart Comment
-
-    loop every 50 ms
-        TMR  ->> OT   : fires
-        OT   ->> BUF  : g_prices[g_head] = Ask
-        OT   ->> OT   : g_head = (g_head+1) % InpWindowSize
-        OT   ->> OT   : if g_count < InpWindowSize: g_count++
-        OT   ->> SCAN : ScanHighLow(g_high, g_low)
-        SCAN ->> SCAN : iterate g_prices[0..g_count-1]
-        SCAN -->> OT  : out_high, out_low
-        OT   ->> UI   : UpdateComment()
+    participant Timer as System Timer
+    participant OnTimer
+    participant Buffer as g_prices[]
+    participant Scan as ScanHighLow
+    participant Comment as UpdateComment
+    
+    loop every InpSampleMs ms
+        Timer->>OnTimer: fire timer event
+        OnTimer->>OnTimer: read current Ask price
+        OnTimer->>Buffer: g_prices[g_head] = Ask
+        OnTimer->>OnTimer: g_head = (g_head + 1) mod InpWindowSize
+        OnTimer->>OnTimer: increment g_count up to InpWindowSize
+        OnTimer->>Scan: call ScanHighLow
+        Scan->>Buffer: iterate g_prices[0..g_count-1]
+        Scan-->>OnTimer: return out_high and out_low
+        OnTimer->>Comment: call UpdateComment()
     end
 ```
 
-### Candle Recognition State Machine
+### 3. Candle Recognition State Flow
 
 ```mermaid
 stateDiagram-v2
-    [*] --> CAND_NONE : RecognizeCandle() entry
-
-    CAND_NONE --> CAND_LONG         : bodysize > avgBody × 1.3
-    CAND_NONE --> CAND_SHORT        : bodysize < avgBody × 0.5
-    CAND_LONG  --> CAND_DOJI        : bodysize < HL × 0.03
-    CAND_SHORT --> CAND_DOJI        : bodysize < HL × 0.03
-    CAND_NONE  --> CAND_DOJI        : bodysize < HL × 0.03
-    CAND_LONG  --> CAND_MARIBOZU_LONG : shadow < body × 0.01
-    CAND_SHORT --> CAND_MARIBOZU    : shadow < body × 0.01
-    CAND_NONE  --> CAND_MARIBOZU    : shadow < body × 0.01
-    CAND_NONE  --> CAND_HAMMER      : shade_low > body×2 AND shade_high < body×0.1
-    CAND_NONE  --> CAND_INVERT_HAMMER : shade_low < body×0.1 AND shade_high > body×2
-    CAND_SHORT --> CAND_SPIN_TOP    : both shadows > body
-
-    CAND_HAMMER         --> [*]
-    CAND_INVERT_HAMMER  --> [*]
-    CAND_SPIN_TOP       --> [*]
-    CAND_MARIBOZU_LONG  --> [*]
-    CAND_MARIBOZU       --> [*]
-    CAND_DOJI           --> [*]
-    CAND_LONG           --> [*]
-    CAND_SHORT          --> [*]
-    CAND_NONE           --> [*]
+    [*] --> RecognizeCandle
+    RecognizeCandle --> LoadData: CopyRates loads MqlRates array
+    LoadData --> Extract: Extract OHLC of last closed bar
+    Extract --> CalcAvg: CalcAverageClose - SMA trend baseline
+    CalcAvg --> CalcBody: CalcAverageBody - mean body size
+    CalcBody --> CalcShd: CalcShades - upper and lower shadows
+    
+    CalcShd --> CheckLong: bodysize > avgBody x 1.3?
+    CheckLong --> CAND_LONG: Yes
+    CheckLong --> CheckShort: No
+    
+    CheckShort --> CAND_SHORT: bodysize < avgBody x 0.5?
+    CheckShort --> KeepNone: No
+    
+    CAND_SHORT --> CheckDoji: bodysize < HL x 0.03?
+    KeepNone --> CheckDoji
+    CAND_LONG --> CheckDoji
+    CheckDoji --> CAND_DOJI: Yes
+    CheckDoji --> CheckMarubozu: No
+    
+    CAND_DOJI --> CheckMarubozu
+    CheckMarubozu --> CAND_MARUBOZU: Any shadow < body x 0.01?
+    CheckMarubozu --> CheckHammer: No
+    
+    CAND_MARUBOZU --> CheckHammer
+    CheckHammer --> CAND_HAMMER: shade_low > body x 2 AND shade_high < body x 0.1?
+    CheckHammer --> CheckInverted: No
+    
+    CAND_HAMMER --> CheckInverted
+    CheckInverted --> CAND_INVERTED_HAMMER: shade_low < body x 0.1 AND shade_high > body x 2?
+    CheckInverted --> CheckSpin: No
+    
+    CAND_INVERTED_HAMMER --> CheckSpin
+    CheckSpin --> CAND_SPINNING_TOP: Current type is CAND_SHORT AND both shadows > body?
+    CheckSpin --> RetainType: No
+    
+    CAND_SPINNING_TOP --> Return
+    RetainType --> Return
+    Return --> [*]: Return classified CANDLE_STRUCTURE
 ```
 
-### EA Lifecycle
+### 4. EA Lifecycle
 
 ```mermaid
 flowchart TD
-    A([EA Attached]) --> B[OnInit]
-    B --> C{Validate Inputs}
-    C -->|fail| D([INIT_PARAMETERS_INCORRECT])
-    C -->|ok| E[ArrayResize + ArrayInitialize]
-    E --> F[EventSetMillisecondTimer]
-    F -->|fail| G([INIT_FAILED])
-    F -->|ok| H([EA Running])
-    H -->|every InpSampleMs| I[OnTimer]
-    H -->|every tick| J[OnTick]
-    H -->|remove / close| K[OnDeinit]
-    K --> L[EventKillTimer]
-    L --> M[Comment clear]
-    M --> N([EA Stopped])
+    Start[EA attached to chart] --> OnInit
+    OnInit --> Validate{Validate all inputs}
+    Validate -->|Invalid| FailParam[Return INIT_PARAMETERS_INCORRECT]
+    Validate -->|Valid| Allocate[ArrayResize and ArrayInitialize g_prices]
+    Allocate --> SetTimer[EventSetMillisecondTimer InpSampleMs]
+    SetTimer --> CheckTimer{Timer started?}
+    CheckTimer -->|No| FailTimer[Return INIT_FAILED]
+    CheckTimer -->|Yes| Running[EA Running]
+    
+    Running --> TimerEvent[OnTimer - every InpSampleMs ms]
+    Running --> TickEvent[OnTick - every price tick]
+    Running --> Deinit[OnDeinit - EA removed or terminal closed]
+    
+    TimerEvent --> Sample[Sample Ask into circular buffer]
+    Sample --> ScanHL[ScanHighLow updates g_high and g_low]
+    ScanHL --> UpdateC[UpdateComment refreshes chart overlay]
+    UpdateC --> Running
+    
+    TickEvent --> NewBarCheck{IsNewBar?}
+    NewBarCheck -->|No| Skip[Skip - wait for next tick]
+    NewBarCheck -->|Yes| RecogC[RecognizeCandle classifies closed bar]
+    RecogC --> PrintLog[Print classification to Experts journal]
+    PrintLog --> TradeEntry[Trade logic entry point - add order code here]
+    TradeEntry --> Running
+    Skip --> Running
+    
+    Deinit --> KillTimer[EventKillTimer]
+    KillTimer --> ClearComment[Comment cleared]
+    ClearComment --> Stopped[EA Stopped]
+    
+    FailParam --> Stopped
+    FailTimer --> Stopped
 ```
 
 ---
 
 ## Installation
 
-1. Copy `oneminuteman_merged.mq4` to your MT4 `MQL4/Experts/` folder.
+1. Copy `oneminuteman.mq4` to your MT4 `MQL4/Experts/` folder.
 2. In MetaEditor, open the file and press **F7** to compile. Confirm zero errors and zero warnings.
 3. In MetaTrader 4, open a chart (any symbol / timeframe).
 4. Drag the EA from the Navigator panel onto the chart.
@@ -291,8 +295,8 @@ flowchart TD
 | Parameter | Default | Range | Description |
 |---|---|---|---|
 | `InpSampleMs` | `50` | ≥ 10 | Timer interval in milliseconds. `50 ms × 1200 = 60 s` rolling window at defaults. |
-| `InpWindowSize` | `1200` | 2 – 1200 | Circular buffer size (sample count). Window duration = `InpWindowSize × InpSampleMs` ms. |
-| `InpAverPeriod` | `10` | ≥ 2 | Bars used to compute average body size and SMA close for trend direction. |
+| `InpWindowSize` | `1200` | 60 – 20000 | Circular buffer size (sample count). Window duration = `InpWindowSize × InpSampleMs` ms. |
+| `InpAverPeriod` | `14` | 1 – 500 | Bars used to compute average body size and SMA close for trend direction. |
 
 ---
 
@@ -304,38 +308,39 @@ flowchart TD
 
 | Value | Description | Detection Condition |
 |---|---|---|
-| `CAND_NONE` | Unclassified | Default — no rule matched |
+| `CAND_UNKNOWN` | Unclassified | Default — no rule matched |
 | `CAND_DOJI` | Doji | `bodysize < HL × 0.03` |
 | `CAND_SHORT` | Short body | `bodysize < avgBody × 0.5` |
 | `CAND_LONG` | Long body | `bodysize > avgBody × 1.3` |
-| `CAND_MARIBOZU` | Marubozu | Either shadow `< body × 0.01` |
-| `CAND_MARIBOZU_LONG` | Marubozu Long | `CAND_LONG` + either shadow `< body × 0.01` |
+| `CAND_MARUBOZU` | Marubozu | Either shadow `< body × 0.01` |
 | `CAND_HAMMER` | Hammer | `shade_low > body×2` AND `shade_high < body×0.1` |
-| `CAND_INVERT_HAMMER` | Inverted Hammer | `shade_low < body×0.1` AND `shade_high > body×2` |
-| `CAND_SPIN_TOP` | Spinning Top | `CAND_SHORT` + both shadows `> body` |
-| `CAND_STAR` | Star | Reserved — multi-candle composite |
+| `CAND_INVERTED_HAMMER` | Inverted Hammer | `shade_low < body×0.1` AND `shade_high > body×2` |
+| `CAND_SPINNING_TOP` | Spinning Top | `CAND_SHORT` + both shadows `> body` |
 
 #### `TYPE_TREND`
 
 | Value | Condition |
 |---|---|
-| `TREND_UPPER` | SMA of previous closes `<` current close |
-| `TREND_DOWN` | SMA of previous closes `>` current close |
-| `TREND_LATERAL` | SMA of previous closes `==` current close |
+| `TREND_UNKNOWN` | Default |
+| `TREND_UPPER` | `close > avg_close` |
+| `TREND_DOWN` | `close < avg_close` |
+| `TREND_LATERAL` | `close == avg_close` |
 
 ### `CANDLE_STRUCTURE` Fields
 
 | Field | Type | Description |
 |---|---|---|
+| `type` | `TYPE_CANDLESTICK` | Classified pattern after full priority chain |
+| `unit` | `TYPE_TREND` | Trend direction vs `InpAverPeriod` SMA |
+| `bodysize` | `double` | `MathAbs(open - close)` in price units |
+| `shade_high` | `double` | Upper shadow length |
+| `shade_low` | `double` | Lower shadow length |
+| `avg_close` | `double` | SMA close over `InpAverPeriod` |
+| `avg_body` | `double` | Mean body size over `InpAverPeriod` |
 | `open` | `double` | Bar open price |
 | `high` | `double` | Bar high price |
 | `low` | `double` | Bar low price |
 | `close` | `double` | Bar close price |
-| `time` | `datetime` | Bar open time (Unix timestamp) |
-| `trend` | `TYPE_TREND` | Trend direction vs `InpAverPeriod` SMA |
-| `bull` | `bool` | `true` when `close > open` |
-| `bodysize` | `double` | `MathAbs(open - close)` in price units |
-| `type` | `TYPE_CANDLESTICK` | Classified pattern after full priority chain |
 
 ### Global State Variables
 
@@ -347,7 +352,6 @@ flowchart TD
 | `g_high` | `double` | Current rolling high |
 | `g_low` | `double` | Current rolling low |
 | `g_candle` | `CANDLE_STRUCTURE` | Last classified bar pattern |
-| `g_candle_valid` | `bool` | `true` when `g_candle` holds a valid result |
 
 ### Functions
 
@@ -355,13 +359,13 @@ flowchart TD
 |---|---|---|
 | `TFLabel()` | `string` | Clean TF label (`M1`, `H4`) — casts `_Period` to `ENUM_TIMEFRAMES` |
 | `IsNewBar()` | `bool` | `true` once per bar open — static datetime guard |
-| `ScanHighLow(out_high, out_low)` | `void` | Full buffer scan; `DBL_MAX` sentinels |
-| `CalcAverageClose(rt[], n)` | `double` | SMA of `rt[0..n-1].close` |
-| `CalcAverageBody(rt[], n)` | `double` | Mean body size of `rt[1..n]` |
-| `CalcShades(c, sl, sh)` | `void` | Upper/lower shadow calc for bull and bear bars |
+| `ScanHighLow()` | `void` | Full buffer scan; `DBL_MAX` sentinels |
+| `CalcAverageClose(...)` | `double` | SMA close over period |
+| `CalcAverageBody(...)` | `double` | Mean body size over period |
+| `CalcShades(...)` | `void` | Upper/lower shadow calc for bull and bear bars |
 | `RecognizeCandle(...)` | `bool` | Full candle classification — `false` if data insufficient |
-| `CandleTypeName(t)` | `string` | `TYPE_CANDLESTICK` → human label |
-| `TrendName(t)` | `string` | `TYPE_TREND` → human label |
+| `CandleTypeName(...)` | `string` | `TYPE_CANDLESTICK` → human label |
+| `TrendName(...)` | `string` | `TYPE_TREND` → human label |
 | `UpdateComment()` | `void` | Merged dual-panel `Comment()` overlay |
 
 ---
@@ -375,10 +379,10 @@ Rules are applied in priority order — later rules override earlier ones:
 | 1 | `CAND_LONG` | `bodysize > avgBody × 1.3` |
 | 2 | `CAND_SHORT` | `bodysize < avgBody × 0.5` |
 | 3 | `CAND_DOJI` | `HL > 0` AND `bodysize < HL × 0.03` |
-| 4 | `CAND_MARIBOZU` / `CAND_MARIBOZU_LONG` | `bodysize > 0` AND (lower OR upper shadow `< body × 0.01`) |
+| 4 | `CAND_MARUBOZU` | `bodysize > 0` AND (lower OR upper shadow `< body × 0.01`) |
 | 5 | `CAND_HAMMER` | `shade_low > body × 2` AND `shade_high < body × 0.1` |
-| 6 | `CAND_INVERT_HAMMER` | `shade_low < body × 0.1` AND `shade_high > body × 2` |
-| 7 | `CAND_SPIN_TOP` | current type == `CAND_SHORT` AND both shadows `> body` |
+| 6 | `CAND_INVERTED_HAMMER` | `shade_low < body × 0.1` AND `shade_high > body × 2` |
+| 7 | `CAND_SPINNING_TOP` | current type == `CAND_SHORT` AND both shadows `> body` |
 
 ---
 
@@ -388,10 +392,10 @@ Rules are applied in priority order — later rules override earlier ones:
 |---|---|---|
 | 1 | Single-bar patterns only | Multi-candle composites (Engulfing, Harami, Star) require additional lookback in `OnTick()` |
 | 2 | SMA trend — not directional | Equal close prices → `TREND_LATERAL` regardless of bar direction |
-| 3 | `CAND_STAR` unassigned | Reserved; implement composite detection in `OnTick()` as needed |
-| 4 | In-memory only | Buffer resets on EA restart or terminal close |
-| 5 | Timer drift under load | `EventSetMillisecondTimer` is best-effort — intervals may drift under high CPU |
-| 6 | Ask-only sampling | Replace `Ask` with `Bid` in `OnTimer()` for bid-based instruments |
+| 3 | In-memory only | Buffer resets on EA restart or terminal close |
+| 4 | Timer drift under load | `EventSetMillisecondTimer` is best-effort — intervals may drift under high CPU |
+| 5 | Ask-only sampling | Replace `Ask` with `Bid` in `OnTimer()` for bid-based instruments |
+| 6 | No multi-threading | Single-threaded — heavy computation in `OnTick()` can delay timer callbacks |
 
 ---
 
