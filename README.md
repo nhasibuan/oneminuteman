@@ -686,14 +686,14 @@ graph TB
 
 #### Step 1: Download the Indicator
 1. Navigate to the repository: `https://github.com/nhasibuan/oneminuteman`
-2. Download `PPMEfficiency.mq4` file
+2. Download `` file
 3. Save to your computer
 
 #### Step 2: Install in MetaTrader 4
 1. Open MT4 platform
 2. Click **File** → **Open Data Folder**
 3. Navigate to `MQL4` → `Indicators`
-4. Copy `PPMEfficiency.mq4` into this folder
+4. Copy `` into this folder
 5. Restart MT4 or right-click Navigator panel → **Refresh**
 
 #### Step 3: Verify Installation
@@ -831,7 +831,7 @@ When a new swing point is detected with qualifying PPM:
 #### Issue: Indicator Not Calculating
 
 **Solutions:**
-1. Check for compilation errors: Open MetaEditor → Compile `PPMEfficiency.mq4`
+1. Check for compilation errors: Open MetaEditor → Compile ``
 2. Verify `#property strict` is enabled
 3. Ensure standard Zigzag indicator is available in MT4
 4. Check Journal tab for error messages
