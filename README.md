@@ -144,29 +144,40 @@ oneminuteman.mq4 (212 lines)
 
 ### 1. System Dataflow
 
-```mermaid
-flowchart TD
-    Broker[Broker Feed - Ask price] -->|every InpSampleMs ms| Timer[System Timer]
-    Timer --> OnTimer[OnTimer]
-    OnTimer --> Buffer[Write Ask to g_prices at g_head]
-    Buffer --> Advance[Advance g_head circular index]
-    Advance --> Scan[ScanHighLow - update g_high and g_low]
-    
-    Tick[New Tick Event] --> OnTick[OnTick]
-    OnTick --> NewBar{IsNewBar - static datetime guard}
-    NewBar -->|new bar detected| Recognize[RecognizeCandle]
-    Recognize --> Load[Load MqlRates array via CopyRates]
-    Load --> Compute[Compute trend, body size, shadows]
-    Compute --> Rules[Apply 7-rule priority chain]
-    Rules --> Update[Update g_candle]
-    
-    Scan --> Display[UpdateComment]
-    Update --> Display
-    Display --> Chart[Chart Comment - non-blocking overlay]
-    
-    Update --> Trade[Trade Logic Hook]
-    Scan --> Trade
-    Trade -->|g_high, g_low, g_candle available here| Entry[OnTick - entry point for order logic]
+```text
+ TIMER PATH  (every InpSampleMs ms)          TICK PATH  (every price tick)
+ ----------------------------------          ------------------------------
+ Broker Feed (Ask price)                     New Tick Event
+        |                                           |
+        v                                           v
+ System Timer                                 OnTick()
+        |                                           |
+        v                                           v
+ OnTimer()                                    IsNewBar? --no--> wait next tick
+        |                                           | yes
+        v                                           v
+ Write Ask -> g_prices[g_head]                RecognizeCandle()
+        |                                           |
+        v                                           v
+ Advance g_head (circular index)              Load MqlRates via CopyRates
+        |                                           |
+        v                                           v
+ ScanHighLow() -> g_high, g_low               Compute trend / body / shadows
+        |                                           |
+        |                                           v
+        |                                     Apply 7-rule priority chain
+        |                                           |
+        |                                           v
+        |                                     Update g_candle
+        |                                           |
+        +---------------------+---------------------+
+                              v
+                       UpdateComment()
+                              |
+                              v
+                  Chart Comment (non-blocking overlay)
+
+   g_high, g_low, g_candle  -->  OnTick() entry point for order logic
 ```
 
 ### 2. Circular Buffer Write Sequence
@@ -175,7 +186,7 @@ flowchart TD
 sequenceDiagram
     participant Timer as System Timer
     participant OnTimer
-    participant Buffer as g_prices[]
+    participant Buffer as g_prices buffer
     participant Scan as ScanHighLow
     participant Comment as UpdateComment
     
@@ -239,40 +250,45 @@ stateDiagram-v2
 
 ### 4. EA Lifecycle
 
-```mermaid
-flowchart TD
-    Start[EA attached to chart] --> OnInit
-    OnInit --> Validate{Validate all inputs}
-    Validate -->|Invalid| FailParam[Return INIT_PARAMETERS_INCORRECT]
-    Validate -->|Valid| Allocate[ArrayResize and ArrayInitialize g_prices]
-    Allocate --> SetTimer[EventSetMillisecondTimer InpSampleMs]
-    SetTimer --> CheckTimer{Timer started?}
-    CheckTimer -->|No| FailTimer[Return INIT_FAILED]
-    CheckTimer -->|Yes| Running[EA Running]
-    
-    Running --> TimerEvent[OnTimer - every InpSampleMs ms]
-    Running --> TickEvent[OnTick - every price tick]
-    Running --> Deinit[OnDeinit - EA removed or terminal closed]
-    
-    TimerEvent --> Sample[Sample Ask into circular buffer]
-    Sample --> ScanHL[ScanHighLow updates g_high and g_low]
-    ScanHL --> UpdateC[UpdateComment refreshes chart overlay]
-    UpdateC --> Running
-    
-    TickEvent --> NewBarCheck{IsNewBar?}
-    NewBarCheck -->|No| Skip[Skip - wait for next tick]
-    NewBarCheck -->|Yes| RecogC[RecognizeCandle classifies closed bar]
-    RecogC --> PrintLog[Print classification to Experts journal]
-    PrintLog --> TradeEntry[Trade logic entry point - add order code here]
-    TradeEntry --> Running
-    Skip --> Running
-    
-    Deinit --> KillTimer[EventKillTimer]
-    KillTimer --> ClearComment[Comment cleared]
-    ClearComment --> Stopped[EA Stopped]
-    
-    FailParam --> Stopped
-    FailTimer --> Stopped
+```text
+ EA attached to chart
+        |
+        v
+ OnInit()
+        |
+        v
+ Validate all inputs --invalid--> return INIT_PARAMETERS_INCORRECT --+
+        | valid                                                      |
+        v                                                            |
+ ArrayResize + ArrayInitialize g_prices                              |
+        |                                                            |
+        v                                                            |
+ EventSetMillisecondTimer(InpSampleMs)                               |
+        |                                                            |
+        v                                                            |
+ Timer started? --no--> return INIT_FAILED -----------------------+  |
+        | yes                                                     |  |
+        v                                                         |  |
+ +------------------------ EA RUNNING ------------------------+   |  |
+ |                                                            |   |  |
+ |  OnTimer  (every InpSampleMs ms)                           |   |  |
+ |    Sample Ask -> circular buffer                           |   |  |
+ |    ScanHighLow -> g_high, g_low                            |   |  |
+ |    UpdateComment -> refresh chart overlay                  |   |  |
+ |                                                            |   |  |
+ |  OnTick  (every price tick)                                |   |  |
+ |    IsNewBar? --no--> skip, wait for next tick              |   |  |
+ |             \--yes-> RecognizeCandle classifies bar        |   |  |
+ |                      Print classification to journal       |   |  |
+ |                      Trade-logic entry hook (add orders)   |   |  |
+ +-----------------------------+------------------------------+   |  |
+                               | EA removed / terminal closed     |  |
+                               v                                  |  |
+                        OnDeinit()                                |  |
+                        EventKillTimer() + Comment("")            |  |
+                               |                                  |  |
+                               v                                  v  v
+                          EA STOPPED <----------------------------+--+
 ```
 
 ---
@@ -443,20 +459,28 @@ PPM = Distance (pips) / Duration (minutes)
 
 **Description:** The indicator initialization phase establishes buffer structures, configures visual properties, and prepares the calculation engine.
 
-```mermaid
-graph TD
-    A[OnInit Called] --> B[Allocate Index Buffers]
-    B --> C[Set Buffer Properties]
-    C --> C1[ZigzagBuffer: DRAW_SECTION]
-    C --> C2[PPMBuffer: DRAW_NONE]
-    C1 --> D[Set Empty Values]
-    C2 --> D
-    D --> E[Configure Array Series]
-    E --> F[Set Indicator Labels]
-    F --> G[Return INIT_SUCCEEDED]
-    
-    style A fill:#e1f5ff
-    style G fill:#c8e6c9
+```text
+ OnInit() called
+      |
+      v
+ Allocate index buffers
+      |
+      v
+ Set buffer properties
+      +--> ZigzagBuffer : DRAW_SECTION
+      +--> PPMBuffer    : DRAW_NONE
+      |
+      v
+ Set empty values (0.0)
+      |
+      v
+ Configure array series (newest bar = index 0)
+      |
+      v
+ Set indicator labels
+      |
+      v
+ return INIT_SUCCEEDED
 ```
 
 **Key Operations:**
@@ -471,22 +495,23 @@ graph TD
 
 **Description:** On each tick, the indicator receives time-series data from the MT4 platform and prepares arrays for processing.
 
-```mermaid
-graph LR
-    A[OnCalculate Triggered] --> B{Sufficient Bars?}
-    B -->|No| C[Return 0]
-    B -->|Yes| D[Set Arrays as Series]
-    D --> E[time[] array]
-    D --> F[high[] array]
-    D --> G[low[] array]
-    E --> H[Validate Data]
-    F --> H
-    G --> H
-    H --> I[Proceed to Zigzag]
-    
-    style A fill:#fff9c4
-    style I fill:#c8e6c9
-    style C fill:#ffcdd2
+```text
+ OnCalculate triggered
+      |
+      v
+ Sufficient bars? --no--> return 0
+      | yes
+      v
+ Set arrays as series
+      +--> time[]  array
+      +--> high[]  array
+      +--> low[]   array
+      |
+      v
+ Validate data
+      |
+      v
+ Proceed to ZigZag calculation
 ```
 
 **Validation Checks:**
@@ -500,25 +525,31 @@ graph LR
 
 **Description:** Utilizes MT4's built-in Zigzag indicator to identify swing high and swing low points in the market.
 
-```mermaid
-graph TD
-    A[Loop Through Bars] --> B[Call iCustom ZigZag]
-    B --> C{ZigZag Value Valid?}
-    C -->|No/Empty| D[Set Buffer to 0.0]
-    C -->|Yes| E[Store in ZigzagBuffer]
-    E --> F{Previous Swing Exists?}
-    F -->|No| G[Save as First Swing]
-    F -->|Yes| H[Calculate PPM]
-    G --> I[Continue Loop]
-    D --> I
-    H --> J[Store in PPMBuffer]
-    J --> I
-    I --> K{More Bars?}
-    K -->|Yes| A
-    K -->|No| L[Complete]
-    
-    style A fill:#e1f5ff
-    style L fill:#c8e6c9
+```text
+ Loop through bars  <-------------------------------+
+      |                                             |
+      v                                             |
+ Call iCustom(ZigZag)                               |
+      |                                             |
+      v                                             |
+ ZigZag value valid? --no/empty--> set buffer = 0.0 |
+      | yes                              |          |
+      v                                  |          |
+ Store in ZigzagBuffer                   |          |
+      |                                  |          |
+      v                                  |          |
+ Previous swing exists? --no--> save as first swing |
+      | yes                           |  |          |
+      v                               |  |          |
+ Calculate PPM                        |  |          |
+      |                               |  |          |
+      v                               |  |          |
+ Store in PPMBuffer                   |  |          |
+      |                               v  v          |
+      +--------------> More bars? --yes-------------+
+                           | no
+                           v
+                       Complete
 ```
 
 **Zigzag Parameters:**
@@ -532,29 +563,31 @@ graph TD
 
 **Description:** Measures efficiency by computing the pip-per-minute ratio between consecutive swing points.
 
-```mermaid
-graph TD
-    A[Swing Point Detected] --> B[Calculate Price Distance]
-    B --> C[Get Previous Swing Price]
-    C --> D[Compute Absolute Difference]
-    D --> E[Normalize to Pips]
-    E --> E1{Broker Digits?}
-    E1 -->|3 or 5 digits| E2[Point * 10]
-    E1 -->|4 digits| E3[Point * 1]
-    E2 --> F[Calculate Time Duration]
-    E3 --> F
-    F --> G[time_current - time_previous]
-    G --> H[Convert to Minutes]
-    H --> I{Duration > 0?}
-    I -->|Yes| J[PPM = Pips / Minutes]
-    I -->|No| K[Skip Calculation]
-    J --> L[Store PPM Value]
-    K --> M[Continue]
-    L --> M
-    
-    style A fill:#fff9c4
-    style J fill:#4caf50
-    style L fill:#c8e6c9
+```text
+ Swing point detected
+      |
+      v
+ Calculate price distance (get previous swing price -> abs difference)
+      |
+      v
+ Normalize to pips
+      +--> 3 or 5 digit broker --> Point * 10
+      +--> 4 digit broker      --> Point * 1
+      |
+      v
+ Calculate time duration (time_current - time_previous)
+      |
+      v
+ Convert to minutes
+      |
+      v
+ Duration > 0? --no--> skip calculation
+      | yes
+      v
+ PPM = pips / minutes
+      |
+      v
+ Store PPM value
 ```
 
 **Calculation Formula:**
@@ -572,26 +605,27 @@ if (minutes > 0) {
 
 **Description:** Applies threshold filters to identify and display only high-efficiency trading opportunities.
 
-```mermaid
-graph TD
-    A[PPM Calculated] --> B{PPM >= InpMinPPM?}
-    B -->|No| C[Skip Display]
-    B -->|Yes| D{InpShowLabels Enabled?}
-    D -->|No| E[Store Internally Only]
-    D -->|Yes| F[Create Label Object]
-    C --> G[Continue]
-    E --> G
-    F --> H{PPM >= InpTargetPPM?}
-    H -->|Yes| I[Color: Yellow]
-    H -->|No| J[Color: White]
-    I --> K[Display on Chart]
-    J --> K
-    K --> G
-    
-    style B fill:#fff9c4
-    style I fill:#ffeb3b
-    style J fill:#f5f5f5
-    style K fill:#c8e6c9
+```text
+ PPM calculated
+      |
+      v
+ PPM >= InpMinPPM? --no--> skip display
+      | yes
+      v
+ InpShowLabels enabled? --no--> store internally only
+      | yes
+      v
+ Create label object
+      |
+      v
+ PPM >= InpTargetPPM? --yes--> color = Yellow
+      | no                        |
+      v                           |
+ color = White                    |
+      |                           |
+      +-------------+-------------+
+                    v
+            Display on chart
 ```
 
 **Threshold Levels:**
@@ -605,29 +639,32 @@ graph TD
 
 **Description:** Manages chart objects to display PPM values while preventing memory leaks and visual clutter.
 
-```mermaid
-graph TD
-    A[Create/Update Label] --> B{Object Exists?}
-    B -->|Yes| C[Update Properties]
-    B -->|No| D[Create New Object]
-    D --> E[Set Position]
-    C --> F[Set Text]
-    E --> F
-    F --> G[Set Color]
-    G --> H[Set Font Size]
-    H --> I[Set Selectable: False]
-    I --> J[Label Active]
-    J --> K{Cleanup Timer?}
-    K -->|Yes| L[Check Label Age]
-    K -->|No| M[Continue]
-    L --> N{Age > 7 Days?}
-    N -->|Yes| O[Delete Label]
-    N -->|No| M
-    O --> M
-    
-    style A fill:#e1f5ff
-    style J fill:#c8e6c9
-    style O fill:#ffcdd2
+```text
+ Create / update label
+      |
+      v
+ Object exists? --no--> create new object --> set position --+
+      | yes                                                  |
+      v                                                      |
+ Update properties <-------------------------------------+---+
+      |
+      v
+ Set text -> set color -> set font size -> set selectable: false
+      |
+      v
+ Label active
+      |
+      v
+ Cleanup timer due? --no--> continue
+      | yes
+      v
+ Check label age
+      |
+      v
+ Age > 7 days? --no--> continue
+      | yes
+      v
+ Delete label
 ```
 
 **Resource Management:**
@@ -641,41 +678,51 @@ graph TD
 
 **Description:** End-to-end flow showing how data moves through the entire PPM indicator system.
 
-```mermaid
-graph TB
-    A[Market Tick] --> B[OnCalculate]
-    B --> C[Validate Data]
-    C --> D[Zigzag Detection]
-    D --> E{Swing Point?}
-    E -->|No| F[No Action]
-    E -->|Yes| G[Calculate PPM]
-    G --> H[Apply Filters]
-    H --> I{Meets Criteria?}
-    I -->|No| J[Store Only]
-    I -->|Yes| K[Create Label]
-    K --> L[Display on Chart]
-    J --> M[Update Buffers]
-    L --> M
-    M --> N[Return rates_total]
-    N --> O{Cleanup Due?}
-    O -->|Yes| P[Remove Old Labels]
-    O -->|No| Q[Wait Next Tick]
-    P --> Q
-    F --> Q
-    
-    subgraph Initialization
-    Z[OnInit] --> B
-    end
-    
-    subgraph Termination
-    Q -.-> R[OnDeinit]
-    R --> S[Cleanup All Labels]
-    end
-    
-    style A fill:#e3f2fd
-    style K fill:#fff9c4
-    style L fill:#c8e6c9
-    style S fill:#ffcdd2
+```text
+ [Initialization]  OnInit() ---+
+                               |
+ Market tick                   |
+      |                        |
+      v                        v
+ OnCalculate <-----------------+
+      |
+      v
+ Validate data
+      |
+      v
+ ZigZag detection
+      |
+      v
+ Swing point? --no--> no action -------------------+
+      | yes                                        |
+      v                                            |
+ Calculate PPM                                     |
+      |                                            |
+      v                                            |
+ Apply filters                                     |
+      |                                            |
+      v                                            |
+ Meets criteria? --no--> store only --+            |
+      | yes                           |            |
+      v                               |            |
+ Create label -> display on chart     |            |
+      |                               |            |
+      +---------------+---------------+            |
+                      v                            |
+                Update buffers                     |
+                      |                            |
+                      v                            |
+                Return rates_total                 |
+                      |                            |
+                      v                            |
+                Cleanup due? --yes--> remove old labels
+                      | no                         |
+                      v                            |
+                Wait next tick <-------------------+
+                      :
+                      : (indicator removed)
+                      v
+ [Termination]  OnDeinit() --> cleanup all labels
 ```
 
 ---
@@ -686,20 +733,20 @@ graph TB
 
 #### Step 1: Download the Indicator
 1. Navigate to the repository: `https://github.com/nhasibuan/oneminuteman`
-2. Download `` file
+2. Download the `oneminuteman.mq4` file
 3. Save to your computer
 
 #### Step 2: Install in MetaTrader 4
 1. Open MT4 platform
 2. Click **File** → **Open Data Folder**
 3. Navigate to `MQL4` → `Indicators`
-4. Copy `` into this folder
+4. Copy `oneminuteman.mq4` into this folder
 5. Restart MT4 or right-click Navigator panel → **Refresh**
 
 #### Step 3: Verify Installation
 1. Open Navigator panel (Ctrl+N)
 2. Expand **Indicators** → **Custom**
-3. Locate **PPMEfficiency** in the list
+3. Locate **oneminuteman** in the list
 
 ---
 
@@ -707,7 +754,7 @@ graph TB
 
 #### Adding to Chart
 1. Open an M1 (1-minute) chart for your preferred symbol (e.g., EURUSD, XAUUSD)
-2. Drag **PPMEfficiency** from Navigator to the chart
+2. Drag **oneminuteman** from Navigator to the chart
 3. Configuration dialog will appear
 
 #### Parameter Settings
@@ -831,7 +878,7 @@ When a new swing point is detected with qualifying PPM:
 #### Issue: Indicator Not Calculating
 
 **Solutions:**
-1. Check for compilation errors: Open MetaEditor → Compile ``
+1. Check for compilation errors: Open MetaEditor → Compile `oneminuteman.mq4`
 2. Verify `#property strict` is enabled
 3. Ensure standard Zigzag indicator is available in MT4
 4. Check Journal tab for error messages
@@ -878,7 +925,7 @@ The PPM Efficiency Indicator complements the OneMinuteMan EA:
 
 #### Multi-Symbol Monitoring
 1. Open multiple M1 charts (EURUSD, GBPUSD, USDJPY, XAUUSD)
-2. Apply PPMEfficiency to each chart with same settings
+2. Apply oneminuteman to each chart with same settings
 3. Focus on symbols showing highest PPM values (yellow labels)
 4. Trade the most efficient opportunities across all symbols
 
