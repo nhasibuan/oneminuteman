@@ -22,6 +22,8 @@
 - [Data Dictionary](#data-dictionary)
 - [Candle Classification Rules](#candle-classification-rules)
 - [PPM Efficiency Engine](#ppm-efficiency-engine)
+- [Strategy Synthesis](#strategy-synthesis)
+- [SWOT Analysis](#swot-analysis)
 - [On-Chart Panel](#on-chart-panel)
 - [User Guide](#user-guide)
 - [Troubleshooting](#troubleshooting)
@@ -553,6 +555,78 @@ On M1, one candle ≈ one minute, so PPM is effectively **pips per minute**.
 | `HIGH [ENTER]` | `PPM ≥ 4.0` | Ideal efficiency — priority |
 
 > ZigZag is a repainting indicator: the most recent leg can shift until its pivot is confirmed, so treat a fresh PPM reading as provisional until the swing completes.
+
+---
+
+## Strategy Synthesis
+
+The three engines are not three separate tools bolted together — they are three complementary questions about the *same* one-minute moment, and a trade only makes sense when all three answers agree. Inside `OnTick()` the globals `g_ppm`, `g_candle`, and `g_high` / `g_low` form a single decision surface; the "strategy" is simply the logic that reads them together rather than in isolation.
+
+### Each engine owns one question
+
+| Engine | Strategic role | The question it answers |
+|---|---|---|
+| PPM Efficiency | Regime filter / quality gate | *Is the market moving efficiently enough to be worth trading right now?* |
+| Candlestick Recognizer | Direction & setup | *Which way — and is there a valid price-action pattern?* |
+| Range Scanner | Timing & risk framing | *Where is price inside the live 1-minute range, and where do the stop and target sit?* |
+
+### The layered decision: filter, then trigger, then execute
+
+1. **Filter with PPM (regime).** Stand aside while PPM sits in the `LOW [AVOID]` zone — that is inefficient chop. Only *arm* the strategy when PPM reaches `MEDIUM [WATCH]`, and treat `HIGH [ENTER]` as a priority condition. This is what collapses the day's hundreds of micro-moves into a short list of high-quality candidates, and the ZigZag pivots (`pivot_start → pivot_end`) simultaneously hand you the swing context.
+2. **Trigger with the candle (direction).** Once armed, read the last closed M1 bar for the directional trigger. Reversal shapes (Hammer, Inverted Hammer, Doji, Spinning Top) forming *at* a fresh pivot argue for a turn; continuation shapes (Long, Marubozu) argue for momentum. The trend field (Ascending / Descending / Lateral) keeps you from fading a strong leg.
+3. **Execute with the range (timing & risk).** The rolling 1-minute high/low is the precise entry reference and the risk envelope: enter on interaction with a boundary (break or rejection), set the stop just beyond the opposite boundary or the swing pivot, and size the target off the current range width. Because the range refreshes every `InpSampleMs`, it naturally matches the 30 s – 2.5 min holding window the PPM philosophy is built around.
+
+### Worked confluence examples
+
+- **Efficient reversal long** — PPM `HIGH` after a down-leg (`pivot_end` is a swing low), the last M1 bar prints a Hammer, trend rotates to Ascending, and Ask is pressing the rolling low → go long, stop below the rolling low, scale out toward the rolling high.
+- **Efficient continuation** — PPM `HIGH`, a Marubozu or Long bar in the trend direction, and price breaking the rolling high → momentum entry with the trend, trailing behind the rolling low.
+- **Stand aside** — PPM `LOW`, *or* a Doji / Spinning Top under a Lateral trend, *or* a range too tight to pay for the spread → no trade, no matter how tempting the chart looks.
+
+### The unifying thesis — "the one-minute man"
+
+Capture a *single*, high-efficiency, roughly one-minute move. Enter only when efficiency (PPM), price action (candle), and location (range) agree; hold for a short, defined window; exit as efficiency fades. Minimizing time in the market is itself the risk control — the shorter the exposure, the less the position is at the mercy of drift, news, and noise. Each engine covers the others' blind spot: PPM ignores direction, the candle ignores efficiency, and the range ignores both but frames the trade — together they describe one coherent, disciplined scalping decision.
+
+---
+
+## SWOT Analysis
+
+A strategic assessment of the combined three-engine approach.
+
+### Strengths
+
+- **Triple confluence** filters noise: a signal must clear efficiency (PPM), pattern (candle), and location (range) before it counts, sharply reducing false positives versus any single engine.
+- **Low-latency, event-driven core:** 50 ms Ask sampling and a non-blocking `Comment()` panel suit fast M1 scalping without freezing the terminal.
+- **Efficiency-first selection:** PPM concentrates attention on high pip-per-minute moves and screens out low-quality chop.
+- **Robust and portable:** `DBL_MAX` sentinels and 3/4/5-digit pip normalization make it instrument- and broker-agnostic.
+- **Single, clean decision surface:** all signals converge on shared globals in `OnTick()`, so order logic is trivial to layer on.
+- **Short time-in-market** inherently limits exposure to drift, spread creep, and adverse news.
+
+### Weaknesses
+
+- **ZigZag repaints:** the most recent leg — and therefore the live PPM — is provisional and can lure late entries.
+- **Single-bar patterns only:** no multi-bar confirmation (Engulfing, Harami, morning/evening stars).
+- **Coarse trend proxy:** an SMA-close comparison flags Lateral on equal closes and ignores slope/strength.
+- **Timeframe coupling:** PPM is hard-wired to `PERIOD_M1` while the candle engine follows the chart TF, so the edge is only coherent on M1.
+- **Scaffold, not a system:** no order, stop, or money-management logic ships in the box; execution quality is unproven.
+- **Volatile, stateless memory:** buffers and PPM reset on restart, and the millisecond timer can drift under CPU load.
+
+### Opportunities
+
+- **Confirmation layers:** add multi-candle patterns and a higher-timeframe trend filter to strengthen the trigger.
+- **Adaptive execution:** PPM- and `atr_ratio`-scaled position sizing and dynamic take-profit targets.
+- **Pivot confirmation:** wait for a ZigZag pivot to close before acting to cut repaint risk.
+- **Session & news gating:** suppress signals around NFP/FOMC and outside high-liquidity windows to protect PPM validity.
+- **Data-driven tuning:** log PPM per symbol to build statistical norms and optimize thresholds; enable backtesting.
+- **Reach:** an MQL5/MT5 port plus push/mobile alerts for `HIGH [ENTER]` conditions.
+
+### Threats
+
+- **Execution friction:** slippage, requotes, and latency can erase a tight pip-per-minute edge.
+- **Spread dynamics:** widening spreads in fast or thin markets distort the pip math and eat small targets.
+- **Liquidity gaps:** sparse pivots on illiquid symbols leave PPM stale or in `NO DATA`.
+- **Over-trading:** thresholds set too loosely invite churn in ranging conditions, bleeding costs.
+- **Microstructure & competition:** M1 noise and faster institutional algos disadvantage a discretionary/manual operator.
+- **Broker/regulatory limits:** some brokers restrict scalping or impose minimum holding times that break the model.
 
 ---
 
