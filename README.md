@@ -132,35 +132,32 @@ All three run concurrently through the standard MQL4 event handlers (`OnInit` / 
 
 ## Architecture & Blueprint
 
-```text
-oneminuteman.mq4  (single-file Expert Advisor, #property strict, v5.00)
-  |
-  +-- [Sec 0]  Inputs ....... Range : InpSampleMs, InpWindowSize
-  |                           Candle: InpAverPeriod
-  |                           PPM   : InpZzDepth, InpZzDeviation, InpZzBackstep,
-  |                                   InpZzLookback, InpPpmMinHigh, InpPpmTarget,
-  |                                   InpAtrDailyRef, InpShowPPM
-  +-- [Sec 1]  Constant ..... BUFFER_SIZE = 1202
-  +-- [Sec 2]  Enums ........ TYPE_CANDLESTICK (8) | TYPE_TREND (4) | PPM_ZONE (4)
-  +-- [Sec 3]  Structs ...... CANDLE_STRUCTURE | PPM_RESULT
-  +-- [Sec 4]  Globals ...... g_prices[] g_head g_count g_high g_low
-  |                           g_candle (+ g_candle_valid)
-  |                           g_ppm    (+ g_ppm_valid)
-  +-- [Sec 5]  TFLabel() ............ strict-safe timeframe string
-  +-- [Sec 6]  IsNewBar() ........... static-datetime bar-open guard
-  +-- [Sec 7]  ScanHighLow() ........ circular-buffer range scan (DBL_MAX sentinels)
-  +-- [Sec 8]  CalcShades() / CalcAverageClose() / CalcAverageBody()
-  +-- [Sec 9]  RecognizeCandle() .... 7-rule priority chain + trend classification
-  +-- [Sec 10] CalcPPM() ............ M1 ZigZag pivot scan -> pips/candle -> zone
-  +-- [Sec 11] PpmZoneName() ........ PPM_ZONE -> human label
-  +-- [Sec 12] CandleTypeName() / TrendName()
-  +-- [Sec 13] UpdateComment() ...... unified Range + Candle + PPM panel
-  |
-  +-- OnInit()    validate inputs -> allocate buffer -> EventSetMillisecondTimer
-  +-- OnDeinit()  EventKillTimer -> Comment("")
-  +-- OnTimer()   RefreshRates -> sample Ask -> ScanHighLow -> CalcPPM -> UpdateComment
-  +-- OnTick()    IsNewBar guard -> RecognizeCandle -> Print journal
-```
+`oneminuteman.mq4` is a single strict-mode Expert Advisor with no external `.mqh` dependencies. It is organized into numbered sections followed by the four standard MQL4 event handlers.
+
+**Code sections**
+
+- **Section 0 — Inputs:** range (`InpSampleMs`, `InpWindowSize`), candle (`InpAverPeriod`), and PPM (`InpZzDepth`, `InpZzDeviation`, `InpZzBackstep`, `InpZzLookback`, `InpPpmMinHigh`, `InpPpmTarget`, `InpAtrDailyRef`, `InpShowPPM`).
+- **Section 1 — Constant:** `BUFFER_SIZE = 1202`.
+- **Section 2 — Enums:** `TYPE_CANDLESTICK`, `TYPE_TREND`, `PPM_ZONE`.
+- **Section 3 — Structs:** `CANDLE_STRUCTURE`, `PPM_RESULT`.
+- **Section 4 — Globals:** circular buffer (`g_prices`, `g_head`, `g_count`), rolling range (`g_high`, `g_low`), and the last candle/PPM results with their validity flags (`g_candle`/`g_candle_valid`, `g_ppm`/`g_ppm_valid`).
+- **Section 5 — `TFLabel()`:** strict-safe timeframe string.
+- **Section 6 — `IsNewBar()`:** static-datetime bar-open guard.
+- **Section 7 — `ScanHighLow()`:** circular-buffer range scan with `DBL_MAX` sentinels.
+- **Section 8 — helpers:** `CalcShades()`, `CalcAverageClose()`, `CalcAverageBody()`.
+- **Section 9 — `RecognizeCandle()`:** the 7-rule priority chain plus trend classification.
+- **Section 10 — `CalcPPM()`:** M1 ZigZag pivot scan producing pips-per-candle and an efficiency zone.
+- **Sections 11–12 — labels:** `PpmZoneName()`, `CandleTypeName()`, `TrendName()`.
+- **Section 13 — `UpdateComment()`:** the unified Range + Candle + PPM panel.
+
+**Event handlers**
+
+- **`OnInit()`** validates inputs, allocates the buffer, and starts the millisecond timer.
+- **`OnDeinit()`** kills the timer and clears the comment.
+- **`OnTimer()`** samples Ask, updates the rolling range (`ScanHighLow`), recomputes PPM (`CalcPPM`), and refreshes the panel.
+- **`OnTick()`** runs the new-bar guard, classifies the closed bar, and logs it to the Experts journal.
+
+
 
 ---
 
@@ -187,41 +184,14 @@ The EA is written as a set of deliberate MQL4 design patterns rather than a mono
 
 ### 1. System Dataflow
 
-```text
- TIMER PATH  (every InpSampleMs ms)               TICK PATH  (every price tick)
- ----------------------------------               ------------------------------
- Broker Feed (Ask price)                          New Tick Event
-        |                                                |
-        v                                                v
- System Timer -> OnTimer()                         OnTick()
-        |                                                |
-        v                                                v
- RefreshRates()                                    IsNewBar? --no--> wait next tick
-        |                                                | yes
-        v                                                v
- Write Ask -> g_prices[g_head]                     RecognizeCandle()
-        |                                                |
-        v                                                v
- Advance g_head (circular index)                   CopyRates last closed bar
-        |                                                |
-        v                                                v
- ScanHighLow() -> g_high, g_low                    Compute trend / body / shadows
-        |                                                |
-        v                                                v
- CalcPPM() -> g_ppm (M1 ZigZag pivots)             Apply 7-rule priority chain
-        |                                                |
-        |                                                v
-        |                                          Update g_candle -> Print journal
-        |                                                |
-        +----------------------+-------------------------+
-                               v
-                        UpdateComment()
-                               |
-                               v
-            Chart Comment: Range + Candle + PPM (non-blocking)
+Two independent paths feed one shared display.
 
-   g_high, g_low, g_candle, g_ppm  -->  OnTick() entry point for order logic
-```
+- **Timer path (every `InpSampleMs`):** `OnTimer()` calls `RefreshRates()`, writes the current Ask into the circular buffer at `g_head`, advances the index (wrapping at `InpWindowSize`), then runs `ScanHighLow()` to refresh the rolling `g_high`/`g_low` and `CalcPPM()` to refresh the PPM result.
+- **Tick path (every price quote):** `OnTick()` checks `IsNewBar()`; when a new bar has opened it calls `RecognizeCandle()`, which loads the last closed bar via `CopyRates`, computes trend, body, and shadows, applies the 7-rule priority chain, updates `g_candle`, and prints a journal line.
+
+Both paths converge on `UpdateComment()`, which paints the non-blocking Range + Candle + PPM overlay. The resulting globals — `g_high`, `g_low`, `g_candle`, and `g_ppm` — are the entry point for order logic inside `OnTick()`.
+
+
 
 ### 2. Timer Sampling Sequence
 
@@ -295,90 +265,21 @@ stateDiagram-v2
 
 ### 4. PPM Efficiency Dataflow
 
-```text
- CalcPPM() called (every timer tick)
-      |
-      v
- bars = min(InpZzLookback, Bars - 1)
-      |
-      v
- bars < 4 ? --yes--> return false (no data)
-      | no
-      v
- Scan i = 1..bars : iCustom(Symbol, PERIOD_M1, "ZigZag",
-                            InpZzDepth, InpZzDeviation, InpZzBackstep, 0, i)
-      |
-      v
- Collect 2 most recent non-empty pivots  (pivot1 @ bar1, then pivot2 @ bar2)
-      |
-      v
- Found two pivots? --no--> return false
-      | yes
-      v
- priceDist = |pivot1 - pivot2|
- barDiff   = bar2 - bar1        (M1 candles between the two pivots)
-      |
-      v
- barDiff < 1 ? --yes--> return false
-      | no
-      v
- pipSize   = (Digits == 3 or 5) ? Point * 10 : Point
- pips      = priceDist / pipSize
- ppm       = pips / barDiff
- atr_ratio = ppm / InpAtrDailyRef
-      |
-      v
- Classify zone:
-      ppm >= InpPpmTarget   --> PPM_ZONE_HIGH    "HIGH [ENTER]"
-      ppm >= InpPpmMinHigh  --> PPM_ZONE_MEDIUM  "MEDIUM [WATCH]"
-      else                  --> PPM_ZONE_LOW     "LOW [AVOID]"
-      |
-      v
- Store g_ppm (ppm, pips, candles, atr_ratio, zone, pivot_start, pivot_end)
-```
+`CalcPPM()` runs on every timer tick. It scans up to `min(InpZzLookback, Bars - 1)` bars — bailing out if fewer than four are available — and reads the standard **ZigZag** via `iCustom` on `PERIOD_M1` using the `InpZzDepth`-`InpZzDeviation`-`InpZzBackstep` parameters, collecting the two most recent non-empty pivots (`pivot1 @ bar1`, `pivot2 @ bar2`).
+
+If two valid pivots exist and are at least one bar apart, it takes the absolute price distance, normalizes it to pips with a broker-aware pip size (`Point × 10` on 3/5-digit brokers, otherwise `Point`), and divides by the candle count between the pivots to get PPM. It also computes `atr_ratio = ppm / InpAtrDailyRef`, then classifies the result: `ppm ≥ InpPpmTarget → HIGH [ENTER]`, `ppm ≥ InpPpmMinHigh → MEDIUM [WATCH]`, otherwise `LOW [AVOID]`. The full result — PPM, pips, candle count, ATR ratio, zone, and both pivot times — is stored in `g_ppm`.
+
+
 
 ### 5. EA Lifecycle
 
-```text
- EA attached to chart
-        |
-        v
- OnInit()
-        |
-        v
- Validate inputs (ranges + InpZzBackstep < InpZzDepth)
-        |    --invalid--> return INIT_PARAMETERS_INCORRECT --+
-        | valid                                              |
-        v                                                    |
- ArrayResize + ArrayInitialize g_prices                      |
-        |                                                    |
-        v                                                    |
- EventSetMillisecondTimer(InpSampleMs)                       |
-        |                                                    |
-        v                                                    |
- Timer started? --no--> return INIT_FAILED ---------------+  |
-        | yes                                              |  |
-        v                                                  |  |
- +----------------------- EA RUNNING -----------------------+ |
- |                                                          | |
- |  OnTimer  (every InpSampleMs ms)                         | |
- |    RefreshRates -> sample Ask into circular buffer       | |
- |    ScanHighLow  -> g_high, g_low                         | |
- |    CalcPPM      -> g_ppm (M1 ZigZag)                     | |
- |    UpdateComment-> refresh unified panel                 | |
- |                                                          | |
- |  OnTick  (every price tick)                              | |
- |    IsNewBar? --no--> skip                                | |
- |             \--yes-> RecognizeCandle -> Print journal     | |
- +----------------------------+-----------------------------+ |
-                              | EA removed / terminal closed  |
-                              v                               |
-                       OnDeinit()                             |
-                       EventKillTimer() + Comment("")         |
-                              |                               |
-                              v                               v
-                          EA STOPPED <-------------------------+
-```
+When the EA is attached, `OnInit()` validates every input (including the invariant `InpZzBackstep < InpZzDepth`) and returns `INIT_PARAMETERS_INCORRECT` on any violation; it then allocates and zero-initializes the buffer and starts the millisecond timer, returning `INIT_FAILED` if the timer cannot start.
+
+While running, the EA services two events: `OnTimer()` (sample Ask → `ScanHighLow` → `CalcPPM` → `UpdateComment`) and `OnTick()` (new-bar guard → `RecognizeCandle` → journal print).
+
+When the EA is removed or the terminal closes, `OnDeinit()` kills the timer and clears the chart comment, leaving no residual state.
+
+
 
 ---
 

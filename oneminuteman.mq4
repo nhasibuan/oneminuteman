@@ -444,7 +444,7 @@ void OnTick()
    if(!IsNewBar()) return;
 
    CANDLE_STRUCTURE bar;
-   if(RecognizeCandle(Symbol(), _Period,
+   if(RecognizeCandle(Symbol(), (ENUM_TIMEFRAMES)_Period,
                       iTime(Symbol(), _Period, 1),
                       InpAverPeriod, bar))
    {
