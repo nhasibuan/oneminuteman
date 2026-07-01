@@ -1,10 +1,10 @@
 # OneMinuteMan
 
-> **MetaTrader 4 Expert Advisor** — Rolling 1-minute price range scanner with single-bar candlestick pattern recognition engine.
+> **MetaTrader 4 Expert Advisor** — a single-file EA that unifies **three real-time engines** in one non-blocking chart panel: a rolling 1-minute Ask-range scanner, a single-bar candlestick recognizer, and a Pip-Per-Minute (PPM) efficiency engine.
 
 [![Platform](https://img.shields.io/badge/Platform-MetaTrader%204-blue)](https://www.metatrader4.com)
 [![Language](https://img.shields.io/badge/Language-MQL4-orange)](https://docs.mql4.com)
-[![Version](https://img.shields.io/badge/Version-4.00-green)](https://github.com/nhasibuan/oneminuteman)
+[![Version](https://img.shields.io/badge/Version-5.00-green)](https://github.com/nhasibuan/oneminuteman)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
 
 ---
@@ -15,12 +15,19 @@
 - [Overview](#overview)
 - [Features](#features)
 - [Architecture & Blueprint](#architecture--blueprint)
+- [Design Patterns & MQL4 Best Practices](#design-patterns--mql4-best-practices)
 - [Dataflow](#dataflow)
 - [Installation](#installation)
 - [Input Parameters](#input-parameters)
 - [Data Dictionary](#data-dictionary)
 - [Candle Classification Rules](#candle-classification-rules)
+- [PPM Efficiency Engine](#ppm-efficiency-engine)
+- [On-Chart Panel](#on-chart-panel)
+- [User Guide](#user-guide)
+- [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
+- [References](#references)
+- [License](#license)
 
 ---
 
@@ -30,22 +37,24 @@
 
 #### Problem Statement
 
-Manual traders monitoring short-term price action on MetaTrader 4 have no native, non-blocking tool that simultaneously tracks the intrabar price range (sub-minute resolution) and classifies the most recently closed bar into a named candlestick pattern with trend context. Existing solutions require separate indicators, introduce UI-blocking alert dialogs, or rely on architecturally unsafe infinite loops inside `OnInit()`.
+Manual traders monitoring short-term price action on MetaTrader 4 have no native, non-blocking tool that simultaneously (a) tracks the intrabar price range at sub-minute resolution, (b) classifies the most recently closed bar into a named candlestick pattern with trend context, and (c) quantifies how *efficiently* price is travelling (pips per minute) between swing pivots. Existing solutions require several separate indicators, introduce UI-blocking alert dialogs, or rely on architecturally unsafe infinite loops inside `OnInit()`.
 
 #### Goals
 
 | # | Goal | Success Metric |
 |---|---|---|
-| G1 | Track rolling 1-minute Ask price range in real time | High and low updated within 50 ms of price change |
-| G2 | Classify the last closed bar into a named single-candle pattern | Pattern identified correctly within one tick of bar close |
-| G3 | Display both range and pattern data on chart without blocking UI | `Comment()` overlay — zero modal popups |
-| G4 | Provide clean, extensible entry point for order logic | `OnTick()` exposes `g_high`, `g_low`, `g_candle` for trade logic |
-| G5 | Adhere to MQL4 best practices (event-driven, no `while(1)`) | Compiles with `#property strict`; EA removable cleanly |
+| G1 | Track rolling 1-minute Ask price range in real time | High and low updated within `InpSampleMs` ms of a price change |
+| G2 | Classify the last closed bar into a named single-candle pattern | Pattern identified within one tick of bar close |
+| G3 | Measure movement efficiency (PPM) between the two most recent ZigZag pivots | PPM + zone recomputed every timer tick |
+| G4 | Display range, pattern, and PPM data on chart without blocking the UI | Single `Comment()` overlay — zero modal popups |
+| G5 | Provide a clean, extensible entry point for order logic | `OnTick()` exposes `g_high`, `g_low`, `g_candle`, `g_ppm` for trade logic |
+| G6 | Adhere to MQL4 best practices (event-driven, no `while(1)`) | Compiles with `#property strict`; EA removes cleanly |
 
 #### Non-Goals
 
 - Does **not** place, modify, or close orders (scaffolding only)
 - Does **not** implement multi-candle patterns (Engulfing, Harami, Star composites)
+- Does **not** draw chart objects/labels — all output is via `Comment()`
 - Does **not** support MQL5 / MetaTrader 5 natively (separate port required)
 - Does **not** persist data between EA restarts (in-memory only)
 
@@ -55,8 +64,9 @@ Manual traders monitoring short-term price action on MetaTrader 4 have no native
 |---|---|---|---|
 | US-01 | Scalp trader | See the 1-minute Ask high/low live on chart | I can gauge intrabar volatility at a glance |
 | US-02 | Price action trader | Know the candlestick type of the last closed bar | I can confirm or reject a setup without switching tools |
-| US-03 | EA developer | Have a clean `OnTick()` entry point with range + pattern data | I can add order logic without restructuring the EA |
-| US-04 | MT4 user | Remove the EA without freezing the terminal | The EA lifecycle is correctly managed |
+| US-03 | Efficiency trader | See the PPM (pips/minute) of the current swing leg | I only engage moves that clear my efficiency threshold |
+| US-04 | EA developer | Have a clean `OnTick()` entry point with range + pattern + PPM data | I can add order logic without restructuring the EA |
+| US-05 | MT4 user | Remove the EA without freezing the terminal | The EA lifecycle is correctly managed |
 
 #### Functional Requirements
 
@@ -64,14 +74,15 @@ Manual traders monitoring short-term price action on MetaTrader 4 have no native
 |---|---|---|
 | FR-01 | Sample Ask price every `InpSampleMs` ms via `EventSetMillisecondTimer` | Must Have |
 | FR-02 | Maintain circular buffer of `InpWindowSize` samples | Must Have |
-| FR-03 | Compute true rolling high and low from buffer on every timer tick | Must Have |
+| FR-03 | Compute true rolling high/low from buffer on every timer tick | Must Have |
 | FR-04 | Detect new bar open once per bar via static datetime guard | Must Have |
 | FR-05 | Classify last closed bar using 7-rule priority chain | Must Have |
-| FR-06 | Display merged range + candle panel via `Comment()` | Must Have |
-| FR-07 | Log bar classification to Experts journal via `Print()` | Should Have |
-| FR-08 | Validate all inputs in `OnInit()`; return `INIT_PARAMETERS_INCORRECT` on failure | Must Have |
-| FR-09 | Kill timer and clear comment on `OnDeinit()` | Must Have |
-| FR-10 | Support configurable averaging period for body/trend baseline | Should Have |
+| FR-06 | Compute PPM from the two most recent M1 ZigZag pivots (2-2-1) each timer tick | Must Have |
+| FR-07 | Classify PPM into LOW / MEDIUM / HIGH zones against configurable thresholds | Must Have |
+| FR-08 | Display merged range + candle + PPM panel via `Comment()` | Must Have |
+| FR-09 | Log bar classification (with PPM + zone) to the Experts journal via `Print()` | Should Have |
+| FR-10 | Validate all inputs in `OnInit()`; return `INIT_PARAMETERS_INCORRECT` on failure | Must Have |
+| FR-11 | Kill timer and clear comment on `OnDeinit()` | Must Have |
 
 #### Non-Functional Requirements
 
@@ -80,63 +91,93 @@ Manual traders monitoring short-term price action on MetaTrader 4 have no native
 | NFR-01 | Compiles with `#property strict` — zero warnings |
 | NFR-02 | Single `.mq4` file — no external `.mqh` dependencies |
 | NFR-03 | Circular buffer write is O(1); no O(n) array shifts |
-| NFR-04 | `DBL_MAX` / `-DBL_MAX` sentinels — instrument-agnostic (works on JPY, indices, crypto CFDs) |
-| NFR-05 | No `Alert()`, `MessageBox()`, or blocking calls in timer/tick handlers |
-| NFR-06 | `EventKillTimer()` always paired with `EventSetMillisecondTimer()` |
+| NFR-04 | `DBL_MAX` / `-DBL_MAX` sentinels — instrument-agnostic (JPY, indices, crypto CFDs) |
+| NFR-05 | Broker-agnostic pip normalization (3/4/5-digit brokers) |
+| NFR-06 | No `Alert()`, `MessageBox()`, or blocking calls in timer/tick handlers |
+| NFR-07 | `EventKillTimer()` always paired with `EventSetMillisecondTimer()` |
+| NFR-08 | PPM engine reuses the platform's standard `ZigZag` via `iCustom` — no reimplementation |
 
 ---
 
 ## Overview
 
-**OneMinuteMan** is a single-file MQL4 Expert Advisor that merges two independent engines:
+**OneMinuteMan** is a single-file MQL4 Expert Advisor (`oneminuteman.mq4`) that merges **three independent engines** behind one event loop and one chart panel:
 
-1. **Range Scanner** — samples Ask every 50 ms into a circular buffer and continuously reports the rolling 1-minute high/low.
-2. **Candlestick Recognizer** — on each new bar open, classifies the just-closed bar into one of 9 named single-candle patterns with trend context.
+1. **Range Scanner** — samples Ask every `InpSampleMs` (default 50 ms) into a circular buffer and continuously reports the rolling 1-minute high/low. Timeframe-independent (pure Ask sampling).
+2. **Candlestick Recognizer** — on each new bar open, classifies the just-closed bar of the **chart timeframe** into one of 7 named single-candle patterns with SMA trend context.
+3. **PPM Efficiency Engine** — every timer tick, scans the two most recent **M1 ZigZag** pivots and computes *Pip-Per-Minute* efficiency, an ATR multiple, and a LOW/MEDIUM/HIGH entry zone.
 
-Both engines run concurrently via separate event handlers and expose their results through shared globals ready for trade signal logic.
+All three run concurrently through the standard MQL4 event handlers (`OnInit` / `OnTimer` / `OnTick` / `OnDeinit`) and publish their results into shared globals that are ready for trade-signal logic.
+
+> **Timeframe note:** the Range Scanner is TF-independent, the Candle Recognizer uses the **chart** timeframe (`_Period`), and the PPM engine is **hard-wired to `PERIOD_M1`**. Attach the EA to an **M1 chart** so all three engines describe the same 1-minute context.
 
 ---
 
 ## Features
 
 - Rolling 1-minute high/low with sub-second resolution (configurable down to 10 ms)
-- 9-pattern single-bar candlestick engine: Doji, Hammer, Inverted Hammer, Marubozu, Long, Short, Spinning Top, Star (reserved)
+- 7-pattern single-bar candlestick engine: Long, Short, Doji, Marubozu, Hammer, Inverted Hammer, Spinning Top
 - Trend classification per bar: Ascending / Descending / Lateral (SMA-based)
+- PPM efficiency engine: pips-per-minute over the last M1 ZigZag leg, with ATR multiple and LOW/MEDIUM/HIGH zoning
 - Circular buffer — O(1) write, no array shifting
-- Live dual-panel `Comment()` overlay — range block + candle block
-- `OnTick()` entry point with `g_high`, `g_low`, `g_candle` ready for order logic
+- Unified single-panel `Comment()` overlay — Range block + Candle block + PPM block
+- `OnTick()` entry point with `g_high`, `g_low`, `g_candle`, `g_ppm` ready for order logic
 - Full input validation with `INIT_PARAMETERS_INCORRECT` guard
+- Broker-agnostic pip normalization (3/4/5-digit)
 - MQL4 strict-mode compliant — `(ENUM_TIMEFRAMES)_Period` cast for `EnumToString`
 
 ---
 
 ## Architecture & Blueprint
 
+```text
+oneminuteman.mq4  (single-file Expert Advisor, #property strict, v5.00)
+  |
+  +-- [Sec 0]  Inputs ....... Range : InpSampleMs, InpWindowSize
+  |                           Candle: InpAverPeriod
+  |                           PPM   : InpZzDepth, InpZzDeviation, InpZzBackstep,
+  |                                   InpZzLookback, InpPpmMinHigh, InpPpmTarget,
+  |                                   InpAtrDailyRef, InpShowPPM
+  +-- [Sec 1]  Constant ..... BUFFER_SIZE = 1202
+  +-- [Sec 2]  Enums ........ TYPE_CANDLESTICK (8) | TYPE_TREND (4) | PPM_ZONE (4)
+  +-- [Sec 3]  Structs ...... CANDLE_STRUCTURE | PPM_RESULT
+  +-- [Sec 4]  Globals ...... g_prices[] g_head g_count g_high g_low
+  |                           g_candle (+ g_candle_valid)
+  |                           g_ppm    (+ g_ppm_valid)
+  +-- [Sec 5]  TFLabel() ............ strict-safe timeframe string
+  +-- [Sec 6]  IsNewBar() ........... static-datetime bar-open guard
+  +-- [Sec 7]  ScanHighLow() ........ circular-buffer range scan (DBL_MAX sentinels)
+  +-- [Sec 8]  CalcShades() / CalcAverageClose() / CalcAverageBody()
+  +-- [Sec 9]  RecognizeCandle() .... 7-rule priority chain + trend classification
+  +-- [Sec 10] CalcPPM() ............ M1 ZigZag pivot scan -> pips/candle -> zone
+  +-- [Sec 11] PpmZoneName() ........ PPM_ZONE -> human label
+  +-- [Sec 12] CandleTypeName() / TrendName()
+  +-- [Sec 13] UpdateComment() ...... unified Range + Candle + PPM panel
+  |
+  +-- OnInit()    validate inputs -> allocate buffer -> EventSetMillisecondTimer
+  +-- OnDeinit()  EventKillTimer -> Comment("")
+  +-- OnTimer()   RefreshRates -> sample Ask -> ScanHighLow -> CalcPPM -> UpdateComment
+  +-- OnTick()    IsNewBar guard -> RecognizeCandle -> Print journal
 ```
-oneminuteman.mq4 (212 lines)
-  │
-  ├── [Constants] BUFFER_SIZE = 1202
-  ├── [Inputs] InpSampleMs | InpWindowSize | InpAverPeriod
-  ├── [Enums] TYPE_CANDLESTICK (8) | TYPE_TREND (4)
-  ├── [Struct] CANDLE_STRUCTURE (type + unit + bodysize + shadows + OHLC)
-  ├── [Globals] g_prices[] | g_head | g_count | g_high | g_low | g_candle
-  │
-  ├── Section 1 TFLabel() — safe timeframe string (strict-mode fix)
-  ├── Section 2 IsNewBar() — bar-open guard (static datetime)
-  ├── Section 3 ScanHighLow() — O(n) range scan with DBL_MAX sentinels
-  ├── Section 4 CalcShades() — upper/lower shadow extraction
-  │             CalcAverageClose() — SMA for trend baseline
-  │             CalcAverageBody() — average body for size classification
-  │             RecognizeCandle() — main 7-rule classification function
-  ├── Section 5 CandleTypeName() — enum to string
-  │             TrendName() — enum to string
-  ├── Section 6 UpdateComment() — merged dual-panel chart overlay
-  │
-  ├── OnInit()    validate → allocate → EventSetMillisecondTimer()
-  ├── OnDeinit()  EventKillTimer() → Comment("")
-  ├── OnTimer()   sample Ask → write buffer → ScanHighLow → UpdateComment
-  └── OnTick()    IsNewBar guard → RecognizeCandle → Print log → trade entry
-```
+
+---
+
+## Design Patterns & MQL4 Best Practices
+
+The EA is written as a set of deliberate MQL4 design patterns rather than a monolithic script:
+
+1. **Event-driven, no busy loops.** All work happens inside `OnInit`, `OnTimer`, `OnTick`, and `OnDeinit`. There is no `while(1)` inside `OnInit()` — the terminal stays responsive and the EA is removable at any time.
+2. **Millisecond timer for sub-tick sampling.** `EventSetMillisecondTimer(InpSampleMs)` drives the range scanner and PPM engine independently of tick arrival, so the rolling range keeps updating even in quiet markets.
+3. **Paired resource lifecycle (RAII-style).** Every `EventSetMillisecondTimer()` is matched by `EventKillTimer()` in `OnDeinit()`, and `Comment()` is cleared on exit — no leaked timers or stale overlays.
+4. **Fail-fast input validation.** `OnInit()` gates every input and returns `INIT_PARAMETERS_INCORRECT` on any violation (including the invariant `InpZzBackstep < InpZzDepth`) before allocating resources.
+5. **Circular ring buffer.** The Ask history is a fixed-size ring: O(1) write at `g_head`, wrap with modulo, `g_count` capped at `InpWindowSize`. No `ArrayShift`/reallocation on the hot path.
+6. **Idempotent once-per-bar work.** `IsNewBar()` uses a `static datetime` guard so candle recognition runs exactly once per bar open, not on every tick.
+7. **Sentinel-based extremes.** `ScanHighLow()` seeds with `+DBL_MAX` / `-DBL_MAX` so it is correct on any instrument (JPY, metals, indices, crypto CFDs) without hard-coded price assumptions.
+8. **Broker-agnostic pip normalization.** `pipSize = (Digits == 3 || Digits == 5) ? Point * 10 : Point;` keeps PPM correct across 3/4/5-digit brokers.
+9. **Separation of concerns.** Pure calculators (`ScanHighLow`, `RecognizeCandle`, `CalcPPM`) are isolated from presentation (`UpdateComment`) and from the event glue (`OnTimer`/`OnTick`).
+10. **Value objects + validity flags.** `CANDLE_STRUCTURE` and `PPM_RESULT` bundle related data; `g_candle_valid` / `g_ppm_valid` make the "no data yet" state explicit instead of relying on magic numbers.
+11. **Reuse platform primitives.** PPM calls the terminal's built-in `ZigZag` through `iCustom` rather than re-implementing pivot detection.
+12. **Strict-mode safety.** `#property strict` plus the `(ENUM_TIMEFRAMES)_Period` cast for `EnumToString` — zero warnings, no implicit-conversion surprises.
 
 ---
 
@@ -145,61 +186,63 @@ oneminuteman.mq4 (212 lines)
 ### 1. System Dataflow
 
 ```text
- TIMER PATH  (every InpSampleMs ms)          TICK PATH  (every price tick)
- ----------------------------------          ------------------------------
- Broker Feed (Ask price)                     New Tick Event
-        |                                           |
-        v                                           v
- System Timer                                 OnTick()
-        |                                           |
-        v                                           v
- OnTimer()                                    IsNewBar? --no--> wait next tick
-        |                                           | yes
-        v                                           v
- Write Ask -> g_prices[g_head]                RecognizeCandle()
-        |                                           |
-        v                                           v
- Advance g_head (circular index)              Load MqlRates via CopyRates
-        |                                           |
-        v                                           v
- ScanHighLow() -> g_high, g_low               Compute trend / body / shadows
-        |                                           |
-        |                                           v
-        |                                     Apply 7-rule priority chain
-        |                                           |
-        |                                           v
-        |                                     Update g_candle
-        |                                           |
-        +---------------------+---------------------+
-                              v
-                       UpdateComment()
-                              |
-                              v
-                  Chart Comment (non-blocking overlay)
+ TIMER PATH  (every InpSampleMs ms)               TICK PATH  (every price tick)
+ ----------------------------------               ------------------------------
+ Broker Feed (Ask price)                          New Tick Event
+        |                                                |
+        v                                                v
+ System Timer -> OnTimer()                         OnTick()
+        |                                                |
+        v                                                v
+ RefreshRates()                                    IsNewBar? --no--> wait next tick
+        |                                                | yes
+        v                                                v
+ Write Ask -> g_prices[g_head]                     RecognizeCandle()
+        |                                                |
+        v                                                v
+ Advance g_head (circular index)                   CopyRates last closed bar
+        |                                                |
+        v                                                v
+ ScanHighLow() -> g_high, g_low                    Compute trend / body / shadows
+        |                                                |
+        v                                                v
+ CalcPPM() -> g_ppm (M1 ZigZag pivots)             Apply 7-rule priority chain
+        |                                                |
+        |                                                v
+        |                                          Update g_candle -> Print journal
+        |                                                |
+        +----------------------+-------------------------+
+                               v
+                        UpdateComment()
+                               |
+                               v
+            Chart Comment: Range + Candle + PPM (non-blocking)
 
-   g_high, g_low, g_candle  -->  OnTick() entry point for order logic
+   g_high, g_low, g_candle, g_ppm  -->  OnTick() entry point for order logic
 ```
 
-### 2. Circular Buffer Write Sequence
+### 2. Timer Sampling Sequence
 
 ```mermaid
 sequenceDiagram
     participant Timer as System Timer
     participant OnTimer
-    participant Buffer as g_prices buffer
+    participant Buffer as g_prices ring
     participant Scan as ScanHighLow
-    participant Comment as UpdateComment
-    
+    participant PPM as CalcPPM
+    participant Panel as UpdateComment
+
     loop every InpSampleMs ms
         Timer->>OnTimer: fire timer event
-        OnTimer->>OnTimer: read current Ask price
-        OnTimer->>Buffer: g_prices[g_head] = Ask
+        OnTimer->>OnTimer: RefreshRates and read Ask
+        OnTimer->>Buffer: write Ask at g_head
         OnTimer->>OnTimer: g_head = (g_head + 1) mod InpWindowSize
         OnTimer->>OnTimer: increment g_count up to InpWindowSize
         OnTimer->>Scan: call ScanHighLow
-        Scan->>Buffer: iterate g_prices[0..g_count-1]
-        Scan-->>OnTimer: return out_high and out_low
-        OnTimer->>Comment: call UpdateComment()
+        Scan-->>OnTimer: update g_high and g_low
+        OnTimer->>PPM: call CalcPPM
+        PPM-->>OnTimer: update g_ppm if valid
+        OnTimer->>Panel: call UpdateComment
     end
 ```
 
@@ -213,42 +256,86 @@ stateDiagram-v2
     Extract --> CalcAvg: CalcAverageClose - SMA trend baseline
     CalcAvg --> CalcBody: CalcAverageBody - mean body size
     CalcBody --> CalcShd: CalcShades - upper and lower shadows
-    
+
     CalcShd --> CheckLong: bodysize > avgBody x 1.3?
     CheckLong --> CAND_LONG: Yes
     CheckLong --> CheckShort: No
-    
+
     CheckShort --> CAND_SHORT: bodysize < avgBody x 0.5?
     CheckShort --> KeepNone: No
-    
+
     CAND_SHORT --> CheckDoji: bodysize < HL x 0.03?
     KeepNone --> CheckDoji
     CAND_LONG --> CheckDoji
     CheckDoji --> CAND_DOJI: Yes
     CheckDoji --> CheckMarubozu: No
-    
+
     CAND_DOJI --> CheckMarubozu
     CheckMarubozu --> CAND_MARUBOZU: Any shadow < body x 0.01?
     CheckMarubozu --> CheckHammer: No
-    
+
     CAND_MARUBOZU --> CheckHammer
     CheckHammer --> CAND_HAMMER: shade_low > body x 2 AND shade_high < body x 0.1?
     CheckHammer --> CheckInverted: No
-    
+
     CAND_HAMMER --> CheckInverted
     CheckInverted --> CAND_INVERTED_HAMMER: shade_low < body x 0.1 AND shade_high > body x 2?
     CheckInverted --> CheckSpin: No
-    
+
     CAND_INVERTED_HAMMER --> CheckSpin
     CheckSpin --> CAND_SPINNING_TOP: Current type is CAND_SHORT AND both shadows > body?
     CheckSpin --> RetainType: No
-    
+
     CAND_SPINNING_TOP --> Return
     RetainType --> Return
     Return --> [*]: Return classified CANDLE_STRUCTURE
 ```
 
-### 4. EA Lifecycle
+### 4. PPM Efficiency Dataflow
+
+```text
+ CalcPPM() called (every timer tick)
+      |
+      v
+ bars = min(InpZzLookback, Bars - 1)
+      |
+      v
+ bars < 4 ? --yes--> return false (no data)
+      | no
+      v
+ Scan i = 1..bars : iCustom(Symbol, PERIOD_M1, "ZigZag",
+                            InpZzDepth, InpZzDeviation, InpZzBackstep, 0, i)
+      |
+      v
+ Collect 2 most recent non-empty pivots  (pivot1 @ bar1, then pivot2 @ bar2)
+      |
+      v
+ Found two pivots? --no--> return false
+      | yes
+      v
+ priceDist = |pivot1 - pivot2|
+ barDiff   = bar2 - bar1        (M1 candles between the two pivots)
+      |
+      v
+ barDiff < 1 ? --yes--> return false
+      | no
+      v
+ pipSize   = (Digits == 3 or 5) ? Point * 10 : Point
+ pips      = priceDist / pipSize
+ ppm       = pips / barDiff
+ atr_ratio = ppm / InpAtrDailyRef
+      |
+      v
+ Classify zone:
+      ppm >= InpPpmTarget   --> PPM_ZONE_HIGH    "HIGH [ENTER]"
+      ppm >= InpPpmMinHigh  --> PPM_ZONE_MEDIUM  "MEDIUM [WATCH]"
+      else                  --> PPM_ZONE_LOW     "LOW [AVOID]"
+      |
+      v
+ Store g_ppm (ppm, pips, candles, atr_ratio, zone, pivot_start, pivot_end)
+```
+
+### 5. EA Lifecycle
 
 ```text
  EA attached to chart
@@ -257,62 +344,73 @@ stateDiagram-v2
  OnInit()
         |
         v
- Validate all inputs --invalid--> return INIT_PARAMETERS_INCORRECT --+
-        | valid                                                      |
-        v                                                            |
- ArrayResize + ArrayInitialize g_prices                              |
-        |                                                            |
-        v                                                            |
- EventSetMillisecondTimer(InpSampleMs)                               |
-        |                                                            |
-        v                                                            |
- Timer started? --no--> return INIT_FAILED -----------------------+  |
-        | yes                                                     |  |
-        v                                                         |  |
- +------------------------ EA RUNNING ------------------------+   |  |
- |                                                            |   |  |
- |  OnTimer  (every InpSampleMs ms)                           |   |  |
- |    Sample Ask -> circular buffer                           |   |  |
- |    ScanHighLow -> g_high, g_low                            |   |  |
- |    UpdateComment -> refresh chart overlay                  |   |  |
- |                                                            |   |  |
- |  OnTick  (every price tick)                                |   |  |
- |    IsNewBar? --no--> skip, wait for next tick              |   |  |
- |             \--yes-> RecognizeCandle classifies bar        |   |  |
- |                      Print classification to journal       |   |  |
- |                      Trade-logic entry hook (add orders)   |   |  |
- +-----------------------------+------------------------------+   |  |
-                               | EA removed / terminal closed     |  |
-                               v                                  |  |
-                        OnDeinit()                                |  |
-                        EventKillTimer() + Comment("")            |  |
-                               |                                  |  |
-                               v                                  v  v
-                          EA STOPPED <----------------------------+--+
+ Validate inputs (ranges + InpZzBackstep < InpZzDepth)
+        |    --invalid--> return INIT_PARAMETERS_INCORRECT --+
+        | valid                                              |
+        v                                                    |
+ ArrayResize + ArrayInitialize g_prices                      |
+        |                                                    |
+        v                                                    |
+ EventSetMillisecondTimer(InpSampleMs)                       |
+        |                                                    |
+        v                                                    |
+ Timer started? --no--> return INIT_FAILED ---------------+  |
+        | yes                                              |  |
+        v                                                  |  |
+ +----------------------- EA RUNNING -----------------------+ |
+ |                                                          | |
+ |  OnTimer  (every InpSampleMs ms)                         | |
+ |    RefreshRates -> sample Ask into circular buffer       | |
+ |    ScanHighLow  -> g_high, g_low                         | |
+ |    CalcPPM      -> g_ppm (M1 ZigZag)                     | |
+ |    UpdateComment-> refresh unified panel                 | |
+ |                                                          | |
+ |  OnTick  (every price tick)                              | |
+ |    IsNewBar? --no--> skip                                | |
+ |             \--yes-> RecognizeCandle -> Print journal     | |
+ +----------------------------+-----------------------------+ |
+                              | EA removed / terminal closed  |
+                              v                               |
+                       OnDeinit()                             |
+                       EventKillTimer() + Comment("")         |
+                              |                               |
+                              v                               v
+                          EA STOPPED <-------------------------+
 ```
 
 ---
 
 ## Installation
 
-1. Copy `oneminuteman.mq4` to your MT4 `MQL4/Experts/` folder.
+1. Copy `oneminuteman.mq4` to your MT4 `MQL4/Experts/` folder (**Experts**, not Indicators — this is an EA).
 2. In MetaEditor, open the file and press **F7** to compile. Confirm zero errors and zero warnings.
-3. In MetaTrader 4, open a chart (any symbol / timeframe).
-4. Drag the EA from the Navigator panel onto the chart.
-5. In the EA properties dialog, set `InpSampleMs`, `InpWindowSize`, `InpAverPeriod` as needed and enable **Allow live trading**.
-6. Click **OK**. The dual-panel `Comment()` overlay appears on the chart within the first timer tick.
+3. Ensure the terminal's standard **ZigZag** custom indicator is present (ships with MT4) — the PPM engine calls it via `iCustom`.
+4. In MetaTrader 4, open an **M1** chart (recommended, so all three engines share the same 1-minute context).
+5. Enable **AutoTrading** (the EA runs on timer/tick events).
+6. Drag the EA from the Navigator panel onto the chart.
+7. In the properties dialog, set the inputs as needed, tick **Allow live trading** (harmless — the EA places no orders), and click **OK**. The unified `Comment()` panel appears within the first timer tick.
 
-> **Tip for XAU/USD scalping:** Use default settings (`InpSampleMs=50`, `InpWindowSize=1200`, `InpAverPeriod=10`) on M1 for the most responsive 1-minute range. For H1 candle pattern context, attach a second instance with `InpAverPeriod=20` on an H1 chart.
+> **Tip for XAU/USD or EURUSD scalping:** run defaults (`InpSampleMs=50`, `InpWindowSize=1200`, `InpAverPeriod=14`, ZigZag `2-2-1`, `InpPpmMinHigh=2.0`, `InpPpmTarget=4.0`) on M1 for the most responsive range and PPM readout.
 
 ---
 
 ## Input Parameters
 
-| Parameter | Default | Range | Description |
+| Parameter | Default | Range / Type | Description |
 |---|---|---|---|
-| `InpSampleMs` | `50` | ≥ 10 | Timer interval in milliseconds. `50 ms × 1200 = 60 s` rolling window at defaults. |
-| `InpWindowSize` | `1200` | 60 – 20000 | Circular buffer size (sample count). Window duration = `InpWindowSize × InpSampleMs` ms. |
-| `InpAverPeriod` | `14` | 1 – 500 | Bars used to compute average body size and SMA close for trend direction. |
+| `InpSampleMs` | `50` | int, ≥ 10 | Timer interval in milliseconds. `50 ms × 1200 = 60 s` rolling window at defaults. |
+| `InpWindowSize` | `1200` | int, 60 – 20000 | Circular buffer size (sample count). Window duration = `InpWindowSize × InpSampleMs` ms. |
+| `InpAverPeriod` | `14` | int, 1 – 500 | Bars used to compute average body size and SMA close for trend direction. |
+| `InpZzDepth` | `2` | int, ≥ 1 | ZigZag Depth — minimum bars for a reversal (2 recommended for M1). |
+| `InpZzDeviation` | `2` | int | ZigZag Deviation — minimum move (points) for a new pivot. |
+| `InpZzBackstep` | `1` | int, ≥ 1 and `< InpZzDepth` | ZigZag Backstep — bars skipped after a pivot to suppress false signals. |
+| `InpZzLookback` | `100` | int | Bars scanned back for ZigZag pivots. |
+| `InpPpmMinHigh` | `2.0` | double | PPM threshold — at/above = MEDIUM (acceptable); below = LOW (avoid). |
+| `InpPpmTarget` | `4.0` | double | PPM target — at/above = HIGH (ideal entry zone). |
+| `InpAtrDailyRef` | `1.5` | double | ATR M1 baseline in pips; `atr_ratio = ppm / InpAtrDailyRef`. |
+| `InpShowPPM` | `true` | bool | Show/hide the PPM block in the `Comment()` panel. |
+
+> **Validation invariant:** `OnInit()` rejects configurations where `InpZzBackstep >= InpZzDepth`.
 
 ---
 
@@ -325,10 +423,10 @@ stateDiagram-v2
 | Value | Description | Detection Condition |
 |---|---|---|
 | `CAND_UNKNOWN` | Unclassified | Default — no rule matched |
-| `CAND_DOJI` | Doji | `bodysize < HL × 0.03` |
-| `CAND_SHORT` | Short body | `bodysize < avgBody × 0.5` |
 | `CAND_LONG` | Long body | `bodysize > avgBody × 1.3` |
-| `CAND_MARUBOZU` | Marubozu | Either shadow `< body × 0.01` |
+| `CAND_SHORT` | Short body | `bodysize < avgBody × 0.5` |
+| `CAND_DOJI` | Doji | `HL > 0` AND `bodysize < HL × 0.03` |
+| `CAND_MARUBOZU` | Marubozu | `bodysize > 0` AND smaller shadow `/ body < 0.01` |
 | `CAND_HAMMER` | Hammer | `shade_low > body×2` AND `shade_high < body×0.1` |
 | `CAND_INVERTED_HAMMER` | Inverted Hammer | `shade_low < body×0.1` AND `shade_high > body×2` |
 | `CAND_SPINNING_TOP` | Spinning Top | `CAND_SHORT` + both shadows `> body` |
@@ -342,6 +440,15 @@ stateDiagram-v2
 | `TREND_DOWN` | `close < avg_close` |
 | `TREND_LATERAL` | `close == avg_close` |
 
+#### `PPM_ZONE`
+
+| Value | Condition | Panel Label |
+|---|---|---|
+| `PPM_ZONE_NONE` | No pivots / insufficient data | `NO DATA` |
+| `PPM_ZONE_LOW` | `ppm < InpPpmMinHigh` | `LOW [AVOID]` |
+| `PPM_ZONE_MEDIUM` | `ppm >= InpPpmMinHigh` | `MEDIUM [WATCH]` |
+| `PPM_ZONE_HIGH` | `ppm >= InpPpmTarget` | `HIGH [ENTER]` |
+
 ### `CANDLE_STRUCTURE` Fields
 
 | Field | Type | Description |
@@ -353,21 +460,32 @@ stateDiagram-v2
 | `shade_low` | `double` | Lower shadow length |
 | `avg_close` | `double` | SMA close over `InpAverPeriod` |
 | `avg_body` | `double` | Mean body size over `InpAverPeriod` |
-| `open` | `double` | Bar open price |
-| `high` | `double` | Bar high price |
-| `low` | `double` | Bar low price |
-| `close` | `double` | Bar close price |
+| `open` / `high` / `low` / `close` | `double` | OHLC of the last closed bar |
+
+### `PPM_RESULT` Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `ppm` | `double` | Pips-per-minute efficiency of the last ZigZag leg |
+| `pips` | `double` | Pip distance of the last ZigZag leg |
+| `candles` | `int` | M1 candles spanning the last ZigZag leg |
+| `atr_ratio` | `double` | `ppm / InpAtrDailyRef` (volatility multiple) |
+| `zone` | `PPM_ZONE` | Efficiency classification |
+| `pivot_start` | `datetime` | Older pivot time |
+| `pivot_end` | `datetime` | Most recent pivot time |
 
 ### Global State Variables
 
 | Variable | Type | Description |
 |---|---|---|
-| `g_prices[]` | `double[]` | Circular buffer — `InpWindowSize` Ask samples |
+| `g_prices[]` | `double[]` | Circular buffer — Ask samples (`BUFFER_SIZE = 1202`) |
 | `g_head` | `int` | Next-write index; wraps at `InpWindowSize` |
 | `g_count` | `int` | Valid sample count — capped at `InpWindowSize` |
-| `g_high` | `double` | Current rolling high |
-| `g_low` | `double` | Current rolling low |
+| `g_high` / `g_low` | `double` | Current rolling high / low |
 | `g_candle` | `CANDLE_STRUCTURE` | Last classified bar pattern |
+| `g_candle_valid` | `bool` | `true` once a bar has been classified |
+| `g_ppm` | `PPM_RESULT` | Last PPM computation |
+| `g_ppm_valid` | `bool` | `true` once PPM has valid pivots |
 
 ### Functions
 
@@ -380,9 +498,11 @@ stateDiagram-v2
 | `CalcAverageBody(...)` | `double` | Mean body size over period |
 | `CalcShades(...)` | `void` | Upper/lower shadow calc for bull and bear bars |
 | `RecognizeCandle(...)` | `bool` | Full candle classification — `false` if data insufficient |
+| `CalcPPM(...)` | `bool` | PPM from last two M1 ZigZag pivots — `false` if no valid leg |
+| `PpmZoneName(...)` | `string` | `PPM_ZONE` → human label |
 | `CandleTypeName(...)` | `string` | `TYPE_CANDLESTICK` → human label |
 | `TrendName(...)` | `string` | `TYPE_TREND` → human label |
-| `UpdateComment()` | `void` | Merged dual-panel `Comment()` overlay |
+| `UpdateComment()` | `void` | Unified Range + Candle + PPM `Comment()` panel |
 
 ---
 
@@ -395,10 +515,143 @@ Rules are applied in priority order — later rules override earlier ones:
 | 1 | `CAND_LONG` | `bodysize > avgBody × 1.3` |
 | 2 | `CAND_SHORT` | `bodysize < avgBody × 0.5` |
 | 3 | `CAND_DOJI` | `HL > 0` AND `bodysize < HL × 0.03` |
-| 4 | `CAND_MARUBOZU` | `bodysize > 0` AND (lower OR upper shadow `< body × 0.01`) |
+| 4 | `CAND_MARUBOZU` | `bodysize > 0` AND `min(shade_high, shade_low) / body < 0.01` |
 | 5 | `CAND_HAMMER` | `shade_low > body × 2` AND `shade_high < body × 0.1` |
-| 6 | `CAND_INVERTED_HAMMER` | `shade_low < body × 0.1` AND `shade_high > body × 2` |
+| 6 | `CAND_INVERTED_HAMMER` | `shade_high > body × 2` AND `shade_low < body × 0.1` |
 | 7 | `CAND_SPINNING_TOP` | current type == `CAND_SHORT` AND both shadows `> body` |
+
+Trend is assigned independently: `close > avg_close → Ascending`, `close < avg_close → Descending`, equal → `Lateral`.
+
+---
+
+## PPM Efficiency Engine
+
+The **Pip-Per-Minute (PPM)** engine measures how efficiently price is travelling between swing pivots. High PPM means a lot of pips in little time — the short-exposure, high-quality moves M1 scalpers want.
+
+**Core formula (per the last M1 ZigZag leg):**
+```
+PPM = pip distance between the two most recent pivots
+      ---------------------------------------------------
+              M1 candles between those pivots
+```
+
+On M1, one candle ≈ one minute, so PPM is effectively **pips per minute**.
+
+**How it works (`CalcPPM`, runs every timer tick):**
+- Scans up to `InpZzLookback` bars for the two most recent non-empty **standard ZigZag** pivots (parameters `InpZzDepth`-`InpZzDeviation`-`InpZzBackstep`, i.e. `2-2-1` by default), read via `iCustom(..., "ZigZag", ...)` on `PERIOD_M1`.
+- Normalizes the price distance to pips using broker-aware `pipSize` (`×10` for 3/5-digit brokers).
+- Divides by the candle count between pivots to get `ppm`.
+- Computes `atr_ratio = ppm / InpAtrDailyRef` as a volatility multiple.
+- Classifies the result into a zone.
+
+**Efficiency zones (defaults):**
+
+| Zone | Condition | Meaning |
+|---|---|---|
+| `LOW [AVOID]` | `PPM < 2.0` | Inefficient — skip |
+| `MEDIUM [WATCH]` | `2.0 ≤ PPM < 4.0` | Acceptable — consider with confirmation |
+| `HIGH [ENTER]` | `PPM ≥ 4.0` | Ideal efficiency — priority |
+
+> ZigZag is a repainting indicator: the most recent leg can shift until its pivot is confirmed, so treat a fresh PPM reading as provisional until the swing completes.
+
+---
+
+## On-Chart Panel
+
+All three engines render into a single non-blocking `Comment()` overlay (no chart objects, no popups). Example:
+
+```text
+=== OneMinuteMan v5.00 ===
+Symbol:EURUSD  TF:M1
+--- Range (1-min rolling) ---
+Window : 60 s (1200 samples @ 50 ms)
+Filled : 1200 / 1200
+High   : 1.09321
+Low    : 1.09280
+Range  : 0.00041
+Ask    : 1.09305
+--- Last Closed Bar ---
+Pattern: Doji | Trend: Ascending
+Body   : 0.00002  AvgBody: 0.00015
+OHLC   : 1.09300 / 1.09322 / 1.09298 / 1.09302
+ShadeH : 0.00020  ShadeL: 0.00002
+--- PPM Efficiency (M1 ZigZag 2-2-1) ---
+PPM    : 3.20  [min:2.0 target:4.0]
+Pips   : 16.0  Candles: 5
+ATR x  : 2.1  (ATR ref: 1.5 pip)
+Zone   : MEDIUM [WATCH]
+Pivot  : 14:20  >>  14:25
+```
+
+The Experts journal also receives one `Print()` line per new bar with the candle type, trend, OHLC, and current PPM + zone.
+
+---
+
+## User Guide
+
+### Chart Setup
+
+- **Timeframe:** M1 (1-minute) — recommended so the chart-TF candle engine and the M1-locked PPM engine agree.
+- **Symbol:** any forex pair or instrument (EURUSD, GBPUSD, XAUUSD work well).
+- **AutoTrading:** must be enabled for the EA's event handlers to fire.
+
+### Recommended Configurations
+
+**Conservative (more signals):**
+- `InpPpmMinHigh = 1.5`, `InpPpmTarget = 3.0`
+
+**Balanced (defaults):**
+- `InpPpmMinHigh = 2.0`, `InpPpmTarget = 4.0`
+
+**Ultra-selective (premium only):**
+- `InpPpmMinHigh = 3.0`, `InpPpmTarget = 5.0`
+
+Actual signal counts depend on symbol volatility and session — establish per-symbol norms by logging PPM over time.
+
+### Interpreting the Panel
+
+- **Range block:** current 1-minute high/low, span, and how full the buffer is. Wide range = high intrabar volatility.
+- **Candle block:** the last closed bar's pattern and trend. Use it to confirm/reject a setup.
+- **PPM block:** the efficiency of the current swing leg and its zone. `HIGH [ENTER]` is a priority condition; `LOW [AVOID]` says the move is inefficient.
+
+### Suggested Entry Workflow (manual)
+
+1. **Efficiency:** wait for PPM zone `MEDIUM` or `HIGH`.
+2. **Direction:** a swing high forming with high PPM → potential SHORT; a swing low → potential LONG.
+3. **Confirmation:** align with the candle pattern/trend (e.g. Hammer + Ascending for longs).
+4. **Time management:** target very short holds (≈ 30 s – 2.5 min); exit if PPM drops back into `LOW`.
+
+### Risk Management
+
+- Keep lot sizes small for M1 scalping; risk ≈ 1–2% per trade.
+- Place stops beyond the previous swing pivot (5–10 pips majors; wider for XAUUSD).
+- Factor spread into targets; trade low-spread sessions (e.g. London/NY overlap).
+- Avoid major news releases — volatility distorts PPM.
+
+### Extending into a Trading EA
+
+`OnTick()` is the intended hook. After `RecognizeCandle`, the globals `g_high`, `g_low`, `g_candle`, and `g_ppm` (with `g_ppm_valid`) are populated — add `OrderSend`/position logic there, e.g. only trade when `g_ppm.zone == PPM_ZONE_HIGH` and the candle confirms direction.
+
+---
+
+## Troubleshooting
+
+#### Panel not showing / EA not running
+- Confirm **AutoTrading** is enabled and the EA shows a smiley face on the chart.
+- Recompile in MetaEditor (F7) and check for a green "0 errors, 0 warnings".
+- Check the Experts/Journal tabs for the `OneMinuteMan v5.00 initialized...` line.
+
+#### PPM stuck on `Calculating PPM...` or `NO DATA`
+- The standard **ZigZag** indicator must exist in `MQL4/Indicators/` (it ships with MT4).
+- Load more M1 history (scroll left / lower timeframe once) so at least two pivots exist within `InpZzLookback`.
+- On very quiet symbols, pivots are sparse — increase `InpZzLookback`.
+
+#### PPM values look wrong
+- Verify broker digits (3/4/5) — pip normalization keys off `Digits`.
+- Confirm ZigZag params match your intent (`2-2-1` default); remember `InpZzBackstep` must be `< InpZzDepth`.
+
+#### EA fails to initialize
+- `INIT_PARAMETERS_INCORRECT` means an input is out of range — check `InpSampleMs ≥ 10`, `InpWindowSize 60–20000`, `InpAverPeriod 1–500`, ZigZag params `≥ 1`, and `InpZzBackstep < InpZzDepth`.
 
 ---
 
@@ -406,12 +659,14 @@ Rules are applied in priority order — later rules override earlier ones:
 
 | # | Limitation | Notes |
 |---|---|---|
-| 1 | Single-bar patterns only | Multi-candle composites (Engulfing, Harami, Star) require additional lookback in `OnTick()` |
+| 1 | Single-bar patterns only | Multi-candle composites (Engulfing, Harami, Star) require extra lookback in `OnTick()` |
 | 2 | SMA trend — not directional | Equal close prices → `TREND_LATERAL` regardless of bar direction |
-| 3 | In-memory only | Buffer resets on EA restart or terminal close |
+| 3 | In-memory only | Buffer, candle, and PPM state reset on EA restart or terminal close |
 | 4 | Timer drift under load | `EventSetMillisecondTimer` is best-effort — intervals may drift under high CPU |
 | 5 | Ask-only sampling | Replace `Ask` with `Bid` in `OnTimer()` for bid-based instruments |
-| 6 | No multi-threading | Single-threaded — heavy computation in `OnTick()` can delay timer callbacks |
+| 6 | PPM is M1-locked | `CalcPPM` hard-codes `PERIOD_M1`; the candle engine uses the chart TF, so run on M1 for coherence |
+| 7 | Depends on standard ZigZag | PPM needs the built-in `ZigZag` custom indicator available for `iCustom` |
+| 8 | ZigZag repaints | The most recent swing leg (and its PPM) can change until the pivot is confirmed |
 
 ---
 
@@ -419,594 +674,35 @@ Rules are applied in priority order — later rules override earlier ones:
 
 - [MQL4 Reference — EventSetMillisecondTimer](https://docs.mql4.com/eventfunctions/eventsetmillisecondtimer)
 - [MQL4 Reference — CopyRates](https://docs.mql4.com/series/copyrates)
+- [MQL4 Reference — iCustom](https://docs.mql4.com/indicators/icustom)
 - [MQL5 Article — Analyzing Candlestick Patterns](https://www.mql5.com/en/articles/101)
 - [MQL4 Reference — ENUM_TIMEFRAMES](https://docs.mql4.com/constants/chartconstants/enum_timeframes)
 
+---
+
+## Version History
+
+**v5.00** (current)
+- Unified single-EA design: Range Scanner + Candlestick Recognizer + PPM Efficiency engine share one event loop and one `Comment()` panel
+- PPM engine added (`CalcPPM`, `PPM_RESULT`, `PPM_ZONE`) using the standard M1 ZigZag via `iCustom`
+- Broker-agnostic pip normalization and ATR-multiple readout
+- Documentation harmonized to match the shipped code
 
 ---
 
-## PPM Efficiency Indicator
-
-### Overview
-
-The **Pip Per Minute (PPM) Efficiency Indicator** is a supplementary tool designed to measure market movement efficiency by calculating the ratio of price distance (in pips) to time duration (in minutes). This indicator helps identify high-quality scalping opportunities by filtering for movements that achieve optimal efficiency thresholds.
-
-**Core Formula:**
-```
-PPM = Distance (pips) / Duration (minutes)
-```
-
-**Strategic Objectives:**
-- Filter for high-efficiency movements (≥1.5 PPM minimum, ≥2.0 PPM optimal)
-- Minimize time-based price risk through short exposure periods (30 seconds to 2.5 minutes)
-- Identify 100-150 quality trading opportunities per day from approximately 600 total market movements
-- Utilize M1 timeframe with Zigzag indicator (2-2-1 configuration) for precise swing detection
-
-### Key Features
-
-1. **Efficiency-Based Filtering** - Quantifies trade quality through mathematical precision
-2. **Time Risk Management** - Short exposure reduces directional market risk
-3. **Visual Feedback** - Real-time PPM values displayed directly on chart
-4. **Configurable Parameters** - Input-driven design allows threshold customization
-5. **Broker-Agnostic** - Automatically adjusts for 3/4/5-digit broker configurations
-6. **Resource Optimized** - Automatic cleanup of old labels and memory management
-
----
-
-## Detailed Dataflow Descriptions
-
-### 1. Initialization Dataflow
-
-**Description:** The indicator initialization phase establishes buffer structures, configures visual properties, and prepares the calculation engine.
-
-```text
- OnInit() called
-      |
-      v
- Allocate index buffers
-      |
-      v
- Set buffer properties
-      +--> ZigzagBuffer : DRAW_SECTION
-      +--> PPMBuffer    : DRAW_NONE
-      |
-      v
- Set empty values (0.0)
-      |
-      v
- Configure array series (newest bar = index 0)
-      |
-      v
- Set indicator labels
-      |
-      v
- return INIT_SUCCEEDED
-```
-
-**Key Operations:**
-- Buffer 0 (ZigzagBuffer): Visual representation of swing points
-- Buffer 1 (PPMBuffer): Stores calculated PPM values for each swing
-- Empty value set to 0.0 to distinguish valid data from uninitialized bars
-- Array series configuration ensures proper indexing (newest bar = index 0)
-
----
-
-### 2. Price Data Acquisition Dataflow
-
-**Description:** On each tick, the indicator receives time-series data from the MT4 platform and prepares arrays for processing.
-
-```text
- OnCalculate triggered
-      |
-      v
- Sufficient bars? --no--> return 0
-      | yes
-      v
- Set arrays as series
-      +--> time[]  array
-      +--> high[]  array
-      +--> low[]   array
-      |
-      v
- Validate data
-      |
-      v
- Proceed to ZigZag calculation
-```
-
-**Validation Checks:**
-- Minimum bars: `InpDepth + InpBackstep` required for Zigzag calculation
-- Array series flag ensures consistent indexing across all time series
-- Data integrity verification before proceeding to calculations
-
----
-
-### 3. Zigzag Calculation Dataflow
-
-**Description:** Utilizes MT4's built-in Zigzag indicator to identify swing high and swing low points in the market.
-
-```text
- Loop through bars  <-------------------------------+
-      |                                             |
-      v                                             |
- Call iCustom(ZigZag)                               |
-      |                                             |
-      v                                             |
- ZigZag value valid? --no/empty--> set buffer = 0.0 |
-      | yes                              |          |
-      v                                  |          |
- Store in ZigzagBuffer                   |          |
-      |                                  |          |
-      v                                  |          |
- Previous swing exists? --no--> save as first swing |
-      | yes                           |  |          |
-      v                               |  |          |
- Calculate PPM                        |  |          |
-      |                               |  |          |
-      v                               |  |          |
- Store in PPMBuffer                   |  |          |
-      |                               v  v          |
-      +--------------> More bars? --yes-------------+
-                           | no
-                           v
-                       Complete
-```
-
-**Zigzag Parameters:**
-- **Depth (2):** Minimum number of bars for high/low reversal detection
-- **Deviation (2):** Minimum price change (in points) required for new swing
-- **Backstep (1):** Bars to skip after detecting a swing to avoid false signals
-
----
-
-### 4. PPM Calculation Dataflow
-
-**Description:** Measures efficiency by computing the pip-per-minute ratio between consecutive swing points.
-
-```text
- Swing point detected
-      |
-      v
- Calculate price distance (get previous swing price -> abs difference)
-      |
-      v
- Normalize to pips
-      +--> 3 or 5 digit broker --> Point * 10
-      +--> 4 digit broker      --> Point * 1
-      |
-      v
- Calculate time duration (time_current - time_previous)
-      |
-      v
- Convert to minutes
-      |
-      v
- Duration > 0? --no--> skip calculation
-      | yes
-      v
- PPM = pips / minutes
-      |
-      v
- Store PPM value
-```
-
-**Calculation Formula:**
-```mql4
-double pips = NormalizePips(priceDist);
-int minutes = (int)((time[prevBar] - time[currentBar]) / 60);
-if (minutes > 0) {
-    ppm = pips / minutes;
-}
-```
-
----
-
-### 5. Efficiency Filtering Dataflow
-
-**Description:** Applies threshold filters to identify and display only high-efficiency trading opportunities.
-
-```text
- PPM calculated
-      |
-      v
- PPM >= InpMinPPM? --no--> skip display
-      | yes
-      v
- InpShowLabels enabled? --no--> store internally only
-      | yes
-      v
- Create label object
-      |
-      v
- PPM >= InpTargetPPM? --yes--> color = Yellow
-      | no                        |
-      v                           |
- color = White                    |
-      |                           |
-      +-------------+-------------+
-                    v
-            Display on chart
-```
-
-**Threshold Levels:**
-- **1.5 PPM:** Minimum entry requirement (~150 opportunities/day)
-- **2.0 PPM:** Optimal efficiency target (~100 opportunities/day)
-- Color coding provides instant visual identification of trade quality
-
----
-
-### 6. Label Management Dataflow
-
-**Description:** Manages chart objects to display PPM values while preventing memory leaks and visual clutter.
-
-```text
- Create / update label
-      |
-      v
- Object exists? --no--> create new object --> set position --+
-      | yes                                                  |
-      v                                                      |
- Update properties <-------------------------------------+---+
-      |
-      v
- Set text -> set color -> set font size -> set selectable: false
-      |
-      v
- Label active
-      |
-      v
- Cleanup timer due? --no--> continue
-      | yes
-      v
- Check label age
-      |
-      v
- Age > 7 days? --no--> continue
-      | yes
-      v
- Delete label
-```
-
-**Resource Management:**
-- Hourly cleanup cycle removes labels older than 7 days from visible range
-- Object name convention: `PPM_[timestamp]` for unique identification
-- `OnDeinit()` ensures complete cleanup when indicator is removed
-
----
-
-### 7. Complete System Dataflow
-
-**Description:** End-to-end flow showing how data moves through the entire PPM indicator system.
-
-```text
- [Initialization]  OnInit() ---+
-                               |
- Market tick                   |
-      |                        |
-      v                        v
- OnCalculate <-----------------+
-      |
-      v
- Validate data
-      |
-      v
- ZigZag detection
-      |
-      v
- Swing point? --no--> no action -------------------+
-      | yes                                        |
-      v                                            |
- Calculate PPM                                     |
-      |                                            |
-      v                                            |
- Apply filters                                     |
-      |                                            |
-      v                                            |
- Meets criteria? --no--> store only --+            |
-      | yes                           |            |
-      v                               |            |
- Create label -> display on chart     |            |
-      |                               |            |
-      +---------------+---------------+            |
-                      v                            |
-                Update buffers                     |
-                      |                            |
-                      v                            |
-                Return rates_total                 |
-                      |                            |
-                      v                            |
-                Cleanup due? --yes--> remove old labels
-                      | no                         |
-                      v                            |
-                Wait next tick <-------------------+
-                      :
-                      : (indicator removed)
-                      v
- [Termination]  OnDeinit() --> cleanup all labels
-```
-
----
-
-## User Guide
-
-### Installation
-
-#### Step 1: Download the Indicator
-1. Navigate to the repository: `https://github.com/nhasibuan/oneminuteman`
-2. Download the `oneminuteman.mq4` file
-3. Save to your computer
-
-#### Step 2: Install in MetaTrader 4
-1. Open MT4 platform
-2. Click **File** → **Open Data Folder**
-3. Navigate to `MQL4` → `Indicators`
-4. Copy `oneminuteman.mq4` into this folder
-5. Restart MT4 or right-click Navigator panel → **Refresh**
-
-#### Step 3: Verify Installation
-1. Open Navigator panel (Ctrl+N)
-2. Expand **Indicators** → **Custom**
-3. Locate **oneminuteman** in the list
-
----
-
-### Configuration
-
-#### Adding to Chart
-1. Open an M1 (1-minute) chart for your preferred symbol (e.g., EURUSD, XAUUSD)
-2. Drag **oneminuteman** from Navigator to the chart
-3. Configuration dialog will appear
-
-#### Parameter Settings
-
-**Zigzag Configuration:**
-```
-InpDepth      = 2   // Minimum bars for reversal detection
-InpDeviation  = 2   // Minimum price change in points
-InpBackstep   = 1   // Bars to skip after swing detection
-```
-
-**PPM Thresholds:**
-```
-InpMinPPM     = 1.5   // Minimum efficiency for display (1.5 = ~150 opportunities/day)
-InpTargetPPM  = 2.0   // Target efficiency for highlighting (2.0 = ~100 opportunities/day)
-```
-
-**Visual Settings:**
-```
-InpShowLabels    = true        // Display PPM values on chart
-InpLowPPMColor   = clrWhite    // Color for 1.5-2.0 PPM range
-InpHighPPMColor  = clrYellow   // Color for >=2.0 PPM (optimal)
-```
-
-#### Recommended Configurations
-
-**Conservative (More Opportunities):**
-- InpMinPPM = 1.5
-- InpTargetPPM = 2.0
-- Expect: 150 signals per day
-
-**Aggressive (Higher Quality):**
-- InpMinPPM = 2.0
-- InpTargetPPM = 2.5
-- Expect: 100 signals per day
-
-**Ultra-Selective (Premium Only):**
-- InpMinPPM = 2.5
-- InpTargetPPM = 3.0
-- Expect: 50-70 signals per day
-
----
-
-### Usage Instructions
-
-#### 1. Chart Setup
-- **Timeframe:** M1 (1-minute) - CRITICAL requirement
-- **Symbol:** Any forex pair or instrument (EURUSD, GBPUSD, XAUUSD recommended)
-- **Chart Type:** Candlestick recommended for visual confirmation
-
-#### 2. Interpreting Signals
-
-**Visual Elements:**
-- **Red Zigzag Lines:** Connect swing high and swing low points
-- **White Numbers:** PPM values between 1.5-2.0 (acceptable efficiency)
-- **Yellow Numbers:** PPM values ≥2.0 (optimal efficiency - priority targets)
-
-**Signal Quality Assessment:**
-```
-PPM < 1.5  : Low efficiency - AVOID
-PPM 1.5-2.0: Acceptable - Consider with confirmation
-PPM ≥ 2.0  : High efficiency - PRIORITY targets
-PPM ≥ 3.0  : Exceptional - Rare premium opportunities
-```
-
-#### 3. Entry Strategy
-
-When a new swing point is detected with qualifying PPM:
-
-**Step 1: Validate Efficiency**
-- Check PPM value is ≥ InpMinPPM threshold
-- Yellow labels indicate optimal targets
-
-**Step 2: Confirm Direction**
-- Swing high with high PPM = potential SHORT entry
-- Swing low with high PPM = potential LONG entry
-
-**Step 3: Time Management**
-- Target duration: 30 seconds to 2.5 minutes
-- Exit if efficiency drops (PPM falls below threshold)
-- Use OneMinuteMan EA for execution and pattern confirmation
-
-#### 4. Risk Management
-
-**Position Sizing:**
-- Keep lot sizes small for M1 scalping
-- Maximum 1-2% account risk per trade
-- Consider spread costs in profit calculations
-
-**Stop Loss Guidelines:**
-- Place stop beyond the previous swing point
-- Typical range: 5-10 pips for major pairs
-- Adjust for symbol volatility (XAUUSD may require wider stops)
-
-**Take Profit Targets:**
-- Conservative: 3-5 pips
-- Moderate: 5-8 pips
-- Aggressive: 8-12 pips
-- Always consider PPM value - higher PPM allows tighter targets
-
----
-
-### Troubleshooting
-
-#### Issue: No PPM Labels Displayed
-
-**Solutions:**
-1. Verify `InpShowLabels = true`
-2. Check that chart is M1 timeframe
-3. Lower `InpMinPPM` threshold to see more signals
-4. Ensure sufficient historical data loaded (minimum 500 bars)
-
-#### Issue: Too Many Labels (Chart Clutter)
-
-**Solutions:**
-1. Increase `InpMinPPM` threshold (try 2.0 or higher)
-2. Set `InpShowLabels = false` to hide labels
-3. Zoom out chart to see fewer bars
-4. Wait for automatic cleanup cycle (runs hourly)
-
-#### Issue: Indicator Not Calculating
-
-**Solutions:**
-1. Check for compilation errors: Open MetaEditor → Compile `oneminuteman.mq4`
-2. Verify `#property strict` is enabled
-3. Ensure standard Zigzag indicator is available in MT4
-4. Check Journal tab for error messages
-
-#### Issue: PPM Values Seem Incorrect
-
-**Solutions:**
-1. Verify broker digit configuration (3/4/5 digits)
-2. Check Zigzag parameters match source specification (2-2-1)
-3. Ensure time array is properly set as series
-4. Validate that sufficient bars are available for calculation
-
----
-
-### Best Practices
-
-#### Optimal Trading Conditions
-- **Time Sessions:** London/NY overlap (12:00-16:00 GMT) for highest liquidity
-- **Avoid:** Major news releases (NFP, FOMC, GDP) - volatility skews PPM
-- **Spread Awareness:** Trade during low-spread hours to maximize profit potential
-
-#### Combining with OneMinuteMan EA
-The PPM Efficiency Indicator complements the OneMinuteMan EA:
-
-1. **PPM Indicator:** Identifies high-efficiency swing points
-2. **OneMinuteMan EA:** Validates candlestick patterns and executes trades
-3. **Combined Strategy:** Only trade OneMinuteMan signals that occur at high PPM swing points
-
-#### Performance Monitoring
-- Log PPM values daily to establish symbol-specific norms
-- Track win rate by PPM threshold (1.5-2.0 vs ≥2.0)
-- Adjust `InpMinPPM` based on 30-day statistical analysis
-- Monitor execution speed - slippage can negate PPM advantages
-
-#### Broker Compatibility
-- Verify broker allows M1 scalping without restrictions
-- Test with demo account for minimum 2 weeks
-- Confirm execution quality meets PPM time requirements
-- Check that broker spread remains stable during trading hours
-
----
-
-### Advanced Usage
-
-#### Multi-Symbol Monitoring
-1. Open multiple M1 charts (EURUSD, GBPUSD, USDJPY, XAUUSD)
-2. Apply oneminuteman to each chart with same settings
-3. Focus on symbols showing highest PPM values (yellow labels)
-4. Trade the most efficient opportunities across all symbols
-
-#### Alert Integration (Future Enhancement)
-For developers wanting to add alerts:
-
-```mql4
-if(ppm >= InpTargetPPM) {
-    string alertMsg = "High PPM Detected: " + DoubleToStr(ppm, 2) + 
-                      " on " + Symbol() + " M1";
-    Alert(alertMsg);
-    SendNotification(alertMsg);  // Mobile notification
-}
-```
-
-#### Export PPM Data for Analysis
-PPM values stored in `PPMBuffer[]` can be accessed by:
-- Custom Expert Advisors via `iCustom()` function
-- Exported to CSV for statistical analysis
-- Used in machine learning models for pattern recognition
-
----
-
-### Frequently Asked Questions
-
-**Q: Can I use PPM Indicator on M5 or H1 charts?**
-A: Not recommended. The PPM strategy is specifically designed for M1 charts. Higher timeframes dilute the PPM values, making it impossible to achieve the 2.0 target due to increased time duration.
-
-**Q: How many trades should I expect per day?**
-A: Approximately 100-150 opportunities with InpMinPPM = 1.5, and 50-100 with InpMinPPM = 2.0. Actual count varies by symbol volatility and market conditions.
-
-**Q: Does PPM Indicator generate trade signals?**
-A: No, it's an analytical tool that measures efficiency. It identifies high-quality swing points but does not generate entry/exit signals. Use with OneMinuteMan EA for complete strategy.
-
-**Q: What's the difference between white and yellow labels?**
-A: White labels show PPM between 1.5-2.0 (acceptable efficiency), yellow labels show PPM ≥2.0 (optimal efficiency - priority targets).
-
-**Q: Why are old labels disappearing?**
-A: Automatic cleanup runs hourly to prevent memory leaks and chart clutter. Labels older than 7 days from the visible chart area are removed.
-
-**Q: Can I backtest with PPM values?**
-A: Yes. PPM values are stored in the indicator buffer and can be accessed by Expert Advisors using `iCustom()` function for historical analysis.
-
----
-
-### Support and Resources
-
-**Repository:** https://github.com/nhasibuan/oneminuteman
-
-**Issues/Questions:** Submit via GitHub Issues tab
-
-**Documentation:** This README and inline code comments
-
-**License:** MIT License - free for personal and commercial use
-
----
-
-### Version History
-
-**v5.00** (Current)
-- Initial PPM Efficiency Indicator implementation
-- Integrated with OneMinuteMan EA repository
-- Full dataflow documentation and user guide
-- Broker-agnostic pip normalization
-- Automatic label cleanup and memory management
-
----
-
-### Credits
+## Credits
 
 **Developer:** Norman Hasibuan (nhasibuan)
 
-**Strategy Concept:** Bionics Trading Algorithms - Pip Per Minute (PPM) methodology
+**Strategy Concept:** Bionics Trading Algorithms — Pip Per Minute (PPM) methodology
 
 **References:**
 - MQL4 Documentation: https://docs.mql4.com/
-- Zigzag Indicator Analysis: https://www.mql5.com/en/articles/101
-- PPM Trading Theory: NotebookLM Source Analysis
+- ZigZag Indicator Analysis: https://www.mql5.com/en/articles/101
+- PPM Trading Theory: NotebookLM source analysis
 
 ---
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT License — see the LICENSE file for details.
