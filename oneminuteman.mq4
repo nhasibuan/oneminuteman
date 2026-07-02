@@ -29,7 +29,8 @@ input bool   InpShowPPM     = true;  // Show PPM panel in Comment()
 //--- Trade Management (order execution)
 input bool   InpEnableTrading = false;  // Master switch: allow live order execution
 input double InpBaseLots      = 0.01;   // Base lot size for the first entry
-input int    InpSlippage      = 5;      // Max slippage (points)
+input int    InpSlippage      = 0;      // Max slippage (points); 0 = auto per symbol
+input int    InpMaxSpread     = 0;      // Max spread to allow entry (points); 0 = auto per symbol
 input int    InpMagic         = 202506; // Magic number (position tag)
 input double InpTP_Pips       = 0;      // Take profit (pips); 0 = auto per symbol
 input double InpSL_Pips       = 0;      // Stop loss (pips); 0 = auto per symbol
@@ -41,6 +42,10 @@ input double InpMartMult      = 2.0;    // Lot multiplier per martingale step
 input int    InpMartMaxSteps  = 5;      // Max martingale steps per cycle
 input int    InpAdrPeriod     = 14;     // ADR averaging period (days)
 input double InpAdrFraction   = 0.10;   // Re-entry spacing = fraction of ADR
+//--- Trading Session (local time = UTC + InpTzOffsetHours)
+input int    InpTzOffsetHours    = 7;   // Local timezone offset from UTC (UTC+7)
+input int    InpSessionStartHour = 5;   // Local hour to (re)start trading (Sydney~5 / Tokyo~7)
+input int    InpSessionEndHour   = 24;  // Local hour to stop opening trades (24 = end of day)
 
 //==================================================================
 // SECTION 1 — CONSTANTS & BUFFER
@@ -59,7 +64,10 @@ enum TYPE_CANDLESTICK
    CAND_MARUBOZU,
    CAND_HAMMER,
    CAND_INVERTED_HAMMER,
-   CAND_SPINNING_TOP
+   CAND_SPINNING_TOP,
+   CAND_DRAGONFLY_DOJI,
+   CAND_GRAVESTONE_DOJI,
+   CAND_LONG_LEGGED_DOJI
 };
 
 enum TYPE_TREND
@@ -127,6 +135,8 @@ static double  g_last_lots     = 0.0;
 static int     g_mart_step     = 0;
 static bool    g_await_reentry = false;
 static double  g_adr_pips      = 0.0;
+static datetime g_halt_until     = 0;
+static bool     g_trading_halted = false;
 
 //==================================================================
 // SECTION 5 — UTILITY: TIMEFRAME LABEL
@@ -234,6 +244,19 @@ bool RecognizeCandle(const string sym, const ENUM_TIMEFRAMES per,
    if(res.type == CAND_SHORT &&
       res.shade_low > res.bodysize && res.shade_high > res.bodysize)                       res.type = CAND_SPINNING_TOP;
 
+   // Doji sub-classification: refine a detected Doji by shadow distribution
+   if(res.type == CAND_DOJI)
+   {
+      double rng  = res.high - res.low;
+      double tiny = rng * 0.1;
+      if(res.shade_low > 2.0 * res.shade_high && res.shade_high <= tiny)
+         res.type = CAND_DRAGONFLY_DOJI;
+      else if(res.shade_high > 2.0 * res.shade_low && res.shade_low <= tiny)
+         res.type = CAND_GRAVESTONE_DOJI;
+      else if(res.shade_high > tiny && res.shade_low > tiny)
+         res.type = CAND_LONG_LEGGED_DOJI;
+   }
+
    // Trend
    if(res.close > res.avg_close)      res.unit = TREND_UPPER;
    else if(res.close < res.avg_close) res.unit = TREND_DOWN;
@@ -326,6 +349,9 @@ string CandleTypeName(TYPE_CANDLESTICK tp)
       case CAND_HAMMER:          return "Hammer";
       case CAND_INVERTED_HAMMER: return "InvertedHammer";
       case CAND_SPINNING_TOP:    return "SpinningTop";
+      case CAND_DRAGONFLY_DOJI:  return "DragonflyDoji";
+      case CAND_GRAVESTONE_DOJI: return "GravestoneDoji";
+      case CAND_LONG_LEGGED_DOJI:return "LongLeggedDoji";
       default:                   return "Unknown";
    }
 }
@@ -377,6 +403,72 @@ void ResolveTradeParams(double &tp, double &sl, double &trailStart, double &trai
    trailStep  = (InpTrailStep  > 0.0) ? InpTrailStep  : atstep;
 }
 
+// Per-symbol execution defaults: slippage & max allowed spread (points)
+void GetSymbolExec(int &slippage, int &maxSpread)
+{
+   string s = Symbol();
+   if(StringFind(s, "XAU") >= 0)                                  // Gold
+      { slippage = 30; maxSpread = 50; }
+   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0) // EUR/USD
+      { slippage = 5;  maxSpread = 15; }
+   else                                                            // generic FX
+      { slippage = 10; maxSpread = 25; }
+}
+
+int EffSlippage()
+{
+   int sl, ms; GetSymbolExec(sl, ms);
+   return (InpSlippage > 0) ? InpSlippage : sl;
+}
+
+int EffMaxSpread()
+{
+   int sl, ms; GetSymbolExec(sl, ms);
+   return (InpMaxSpread > 0) ? InpMaxSpread : ms;
+}
+
+bool SpreadOK()
+{
+   int spr = (int)MathRound((Ask - Bid) / Point);
+   int mx  = EffMaxSpread();
+   return (mx <= 0 || spr <= mx);
+}
+
+// Local time = broker GMT + configured offset (UTC+7 by default)
+datetime LocalNow()
+{
+   return (datetime)(TimeGMT() + InpTzOffsetHours * 3600);
+}
+
+// True while inside the daily trading window (local hours)
+bool InSession()
+{
+   int hr   = TimeHour(LocalNow());
+   int endh = (InpSessionEndHour <= InpSessionStartHour) ? 24 : InpSessionEndHour;
+   return (hr >= InpSessionStartHour && hr < endh);
+}
+
+// Stop trading for the rest of the local day; resume tomorrow at session open
+void HaltForToday()
+{
+   datetime loc      = LocalNow();
+   datetime dayStart = loc - (loc % 86400);
+   g_halt_until      = dayStart + 86400 + InpSessionStartHour * 3600;  // tomorrow @ session open (local)
+   g_trading_halted  = true;
+   Print("Martingale cycle maxed -> halt until next session open (local ", TimeToString(g_halt_until), ")");
+}
+
+// Combined gate: within session, not halted for the day
+bool TradingWindowOpen()
+{
+   if(g_trading_halted)
+   {
+      if(LocalNow() >= g_halt_until) g_trading_halted = false;  // new day/session -> resume
+      else                           return false;
+   }
+   return InSession();
+}
+
 // Average Daily Range over InpAdrPeriod days, expressed in pips
 double CalcADR()
 {
@@ -407,7 +499,9 @@ double NormalizeLots(double lots)
 int SignalDirection(const CANDLE_STRUCTURE &c)
 {
    if(c.type == CAND_HAMMER)          return +1;   // bullish reversal
+   if(c.type == CAND_DRAGONFLY_DOJI)  return +1;   // bullish reversal
    if(c.type == CAND_INVERTED_HAMMER) return -1;   // bearish reversal
+   if(c.type == CAND_GRAVESTONE_DOJI) return -1;   // bearish reversal
    if(c.unit == TREND_UPPER && (c.type == CAND_LONG || c.type == CAND_MARUBOZU)) return +1;
    if(c.unit == TREND_DOWN  && (c.type == CAND_LONG || c.type == CAND_MARUBOZU)) return -1;
    return 0;
@@ -454,7 +548,7 @@ bool OpenTrade(int dir, double lots)
    int    type    = (dir > 0) ? OP_BUY : OP_SELL;
 
    int ticket = OrderSend(Symbol(), type, lots, NormalizeDouble(price, Digits),
-                          InpSlippage,
+                          EffSlippage(),
                           NormalizeDouble(slPrice, Digits),
                           NormalizeDouble(tpPrice, Digits),
                           "OneMinuteMan", InpMagic, 0,
@@ -508,7 +602,13 @@ void UpdateTradeState()
       if(profit < 0.0 && InpUseMartingale && g_mart_step < InpMartMaxSteps)
          g_await_reentry = true;
       else
-         { g_await_reentry = false; g_mart_step = 0; }
+      {
+         // Cycle ended: a win, or the martingale ladder hit its max step
+         if(profit < 0.0 && InpUseMartingale && g_mart_step >= InpMartMaxSteps)
+            HaltForToday();   // max steps completed -> stop trading for today
+         g_await_reentry = false;
+         g_mart_step     = 0;
+      }
    }
    g_had_pos = (n > 0);
 }
@@ -518,6 +618,8 @@ void ManageEntries(bool allowFresh)
 {
    if(!InpEnableTrading)    return;
    if(CountPositions() > 0) return;
+   if(!TradingWindowOpen()) return;   // session window + daily halt gate
+   if(!SpreadOK())          return;   // spread filter
 
    // Martingale re-entry: same direction, after adverse move >= fraction of ADR
    if(g_await_reentry && InpUseMartingale && g_mart_step < InpMartMaxSteps)
@@ -629,6 +731,11 @@ void UpdateComment()
                        g_await_reentry ? "[AWAIT RE-ENTRY]" : "");
    msg += StringFormat("ADR:%.0f pips  Re-entry@%.0f pips\n",
                        g_adr_pips, InpAdrFraction * g_adr_pips);
+   msg += StringFormat("Session: %s (UTC+%d %dh-%dh)  Spread<=%d\n",
+                       (TradingWindowOpen() ? "OPEN" : (g_trading_halted ? "HALTED" : "CLOSED")),
+                       InpTzOffsetHours, InpSessionStartHour, InpSessionEndHour, EffMaxSpread());
+   if(g_trading_halted)
+      msg += StringFormat("Resume : %s (local)\n", TimeToString(g_halt_until));
 
    Comment(msg);
 }
@@ -656,6 +763,10 @@ int OnInit()
       { Print("Error: InpAdrPeriod must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
    if(InpAdrFraction <= 0.0)
       { Print("Error: InpAdrFraction must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpSessionStartHour < 0 || InpSessionStartHour > 23)
+      { Print("Error: InpSessionStartHour must be 0-23"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpSessionEndHour < 1 || InpSessionEndHour > 24)
+      { Print("Error: InpSessionEndHour must be 1-24"); return INIT_PARAMETERS_INCORRECT; }
 
    ArrayResize(g_prices, BUFFER_SIZE);
    ArrayInitialize(g_prices, 0.0);
@@ -667,7 +778,8 @@ int OnInit()
          " | ZZ:", InpZzDepth, "-", InpZzDeviation, "-", InpZzBackstep,
          " | PPM min:", InpPpmMinHigh, " target:", InpPpmTarget,
          " | Trading:", (InpEnableTrading ? "ON" : "OFF"),
-         " Martingale:", (InpUseMartingale ? "ON" : "OFF"));
+         " Martingale:", (InpUseMartingale ? "ON" : "OFF"),
+         " | Session UTC+", InpTzOffsetHours, " ", InpSessionStartHour, "h-", InpSessionEndHour, "h");
    return INIT_SUCCEEDED;
 }
 

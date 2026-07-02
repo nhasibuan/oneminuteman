@@ -131,6 +131,9 @@ All three run concurrently through the standard MQL4 event handlers (`OnInit` / 
 - **Forced M1 context** — range, candle, new-bar guard, and PPM all pinned to `PERIOD_M1`
 - **Trade module** — confluence entry, fixed SL/TP, and a trailing stop with auto per-symbol profiles (XAU/USD, EUR/USD)
 - **ADR-spaced martingale** — re-opens after a losing cycle once price moves a fraction of the Average Daily Range
+- **UTC+7 session control** — trades only from the Asian (Sydney/Tokyo) open; **daily halt** after a maxed martingale cycle, auto-resume next session
+- **Per-symbol slippage & spread filters** with auto profiles for XAU/USD and EUR/USD
+- **11 single-bar candlestick patterns** — adds Dragonfly, Gravestone, and Long-Legged Doji
 
 ---
 
@@ -244,59 +247,13 @@ When the EA is removed or the terminal closes, `OnDeinit()` kills the timer and 
 
 ### 6. Data Model
 
-```mermaid
-classDiagram
-    class CANDLE_STRUCTURE {
-        +TYPE_CANDLESTICK type
-        +TYPE_TREND unit
-        +double bodysize
-        +double shade_high
-        +double shade_low
-        +double avg_close
-        +double avg_body
-        +double open
-        +double high
-        +double low
-        +double close
-    }
-    class PPM_RESULT {
-        +double ppm
-        +double pips
-        +int candles
-        +double atr_ratio
-        +PPM_ZONE zone
-        +datetime pivot_start
-        +datetime pivot_end
-    }
-    class TYPE_CANDLESTICK {
-        <<enumeration>>
-        CAND_UNKNOWN
-        CAND_LONG
-        CAND_SHORT
-        CAND_DOJI
-        CAND_MARUBOZU
-        CAND_HAMMER
-        CAND_INVERTED_HAMMER
-        CAND_SPINNING_TOP
-    }
-    class TYPE_TREND {
-        <<enumeration>>
-        TREND_UNKNOWN
-        TREND_UPPER
-        TREND_DOWN
-        TREND_LATERAL
-    }
-    class PPM_ZONE {
-        <<enumeration>>
-        PPM_ZONE_NONE
-        PPM_ZONE_LOW
-        PPM_ZONE_MEDIUM
-        PPM_ZONE_HIGH
-    }
-    CANDLE_STRUCTURE --> TYPE_CANDLESTICK : type
-    CANDLE_STRUCTURE --> TYPE_TREND : unit
-    PPM_RESULT --> PPM_ZONE : zone
-```
+The EA's state is built from two value structs and three enums (full field lists in the [Data Dictionary](#data-dictionary)):
+
+- **`CANDLE_STRUCTURE`** — the classified bar: `type` (`TYPE_CANDLESTICK`), `unit` (`TYPE_TREND`), `bodysize`, `shade_high` / `shade_low`, `avg_close`, `avg_body`, and OHLC.
+- **`PPM_RESULT`** — the efficiency reading: `ppm`, `pips`, `candles`, `atr_ratio`, `zone` (`PPM_ZONE`), and `pivot_start` / `pivot_end`.
+- **Enums** — `TYPE_CANDLESTICK` (Unknown, Long, Short, Doji, Marubozu, Hammer, Inverted Hammer, Spinning Top, Dragonfly Doji, Gravestone Doji, Long-Legged Doji), `TYPE_TREND` (Unknown, Upper, Down, Lateral), and `PPM_ZONE` (None, Low, Medium, High).
+
+Results are published to the globals `g_candle` and `g_ppm` (each with a validity flag), which the trade module reads.
 
 ### 7. Trade Execution & Martingale Flow
 
@@ -309,9 +266,10 @@ sequenceDiagram
     participant Broker
 
     Tick->>State: count positions, detect closed cycle
-    State-->>Tick: arm martingale if last cycle lost
+    State-->>Tick: arm martingale (loss) or halt for day (max steps)
     Tick->>Trail: tighten stop on open positions
     Tick->>Entry: allowFresh = IsNewBar on M1
+    Entry->>Entry: TradingWindowOpen (UTC+7 session, not halted) and SpreadOK ?
     alt awaiting re-entry
         Entry->>Entry: adverse move >= InpAdrFraction x ADR ?
         Entry->>Broker: OrderSend same dir, lots x InpMartMult
@@ -360,7 +318,8 @@ sequenceDiagram
 |---|---|---|---|
 | `InpEnableTrading` | `false` | bool | Master switch — must be `true` to place any order. |
 | `InpBaseLots` | `0.01` | double | Base lot size for the first entry of a cycle. |
-| `InpSlippage` | `5` | int | Max slippage (points) on `OrderSend`. |
+| `InpSlippage` | `0` | int | Max slippage (points) on `OrderSend`; `0` = auto per symbol. |
+| `InpMaxSpread` | `0` | int | Max spread (points) to allow an entry; `0` = auto per symbol. |
 | `InpMagic` | `202506` | int | Magic number tagging this EA's positions. |
 | `InpTP_Pips` | `0` | double | Take profit (pips); `0` = auto per-symbol profile. |
 | `InpSL_Pips` | `0` | double | Stop loss (pips); `0` = auto per-symbol profile. |
@@ -371,6 +330,9 @@ sequenceDiagram
 | `InpMartMaxSteps` | `5` | int | Max martingale re-entries per cycle. |
 | `InpAdrPeriod` | `14` | int | Days used to average the ADR. |
 | `InpAdrFraction` | `0.10` | double | Re-entry spacing = this fraction of ADR (pips). |
+| `InpTzOffsetHours` | `7` | int | Local timezone offset from UTC (UTC+7). |
+| `InpSessionStartHour` | `5` | int | Local hour to (re)start trading — Asian open (Sydney~5 / Tokyo~7). |
+| `InpSessionEndHour` | `24` | int | Local hour to stop opening new trades (`24` = end of day). |
 
 > **Validation invariant:** `OnInit()` rejects configurations where `InpZzBackstep >= InpZzDepth`.
 
@@ -392,6 +354,9 @@ sequenceDiagram
 | `CAND_HAMMER` | Hammer | `shade_low > body×2` AND `shade_high < body×0.1` |
 | `CAND_INVERTED_HAMMER` | Inverted Hammer | `shade_low < body×0.1` AND `shade_high > body×2` |
 | `CAND_SPINNING_TOP` | Spinning Top | `CAND_SHORT` + both shadows `> body` |
+| `CAND_DRAGONFLY_DOJI` | Dragonfly Doji | Doji with long lower shadow, tiny upper (bullish) |
+| `CAND_GRAVESTONE_DOJI` | Gravestone Doji | Doji with long upper shadow, tiny lower (bearish) |
+| `CAND_LONG_LEGGED_DOJI` | Long-Legged Doji | Doji with long upper AND lower shadows (indecision) |
 
 #### `TYPE_TREND`
 
@@ -484,6 +449,8 @@ Rules are applied in priority order — later rules override earlier ones:
 
 Trend is assigned independently: `close > avg_close → Ascending`, `close < avg_close → Descending`, equal → `Lateral`.
 
+A detected Doji is further refined by shadow distribution into **Dragonfly** (long lower / tiny upper — bullish), **Gravestone** (long upper / tiny lower — bearish), or **Long-Legged** (both shadows long — indecision). Candidate patterns to add next (they need trend context, which `unit` already provides): **Shooting Star** (Inverted-Hammer shape in an uptrend), **Hanging Man** (Hammer shape in an uptrend), and **Belt Hold**.
+
 ---
 
 ## PPM Efficiency Engine
@@ -546,11 +513,31 @@ Auto-selected by `GetSymbolProfile()`; override any value with the matching `Inp
 
 > These are conservative M1-scalping starting points, **not** optimized values — backtest and forward-test per broker before risking capital.
 
+### Slippage & spread
+
+`InpSlippage` and `InpMaxSpread` default to `0` = auto per-symbol (`GetSymbolExec`). An entry is skipped when the current spread exceeds the max. Suggested values (broker points):
+
+| | EUR/USD | XAU/USD (Gold) |
+|---|---|---|
+| Max slippage | 5 pts (~0.5 pip) | 30 pts (~`$0.30`) |
+| Max spread to enter | 15 pts (~1.5 pip) | 50 pts (~`$0.50`) |
+| Typical live spread | 2–10 pts | 15–35 pts |
+
+Trade the low-spread hours (London/NY overlap for EUR/USD) and avoid the daily rollover, when spreads balloon — especially on Gold.
+
 ### Martingale re-entry (ADR-spaced)
 
 After a cycle closes at a loss and `InpUseMartingale` is on, the EA arms a re-entry. It waits until price has moved **against** the previous entry by at least `InpAdrFraction × ADR` pips — ADR is the Average Daily Range from `CalcADR()` over `InpAdrPeriod` days — then re-opens the **same** direction with `lots × InpMartMult`, up to `InpMartMaxSteps` times. A winning cycle resets the progression to step 0.
 
 > **Risk warning:** martingale increases exposure precisely when the strategy is losing. A sustained adverse run escalates lot size geometrically and can blow the account. Keep `InpBaseLots` tiny, cap `InpMartMaxSteps`, and never run it unattended without a hard equity/drawdown stop.
+
+### Trading session (UTC+7)
+
+Local time is `TimeGMT() + InpTzOffsetHours` (default **UTC+7**). New positions open only inside the daily window `[InpSessionStartHour, InpSessionEndHour)` in local time. The default start hour `5` aligns with the Asian session open — **Sydney (Australia)** opens ~05:00–06:00 UTC+7 and **Tokyo (Japan)** ~07:00 UTC+7 — and the window runs to end of day (`24`). Open positions are always managed (trailing/SL/TP) regardless of the window; only new entries are gated.
+
+### Daily halt after max martingale
+
+When a martingale ladder reaches `InpMartMaxSteps` and the final step still closes at a loss, the EA calls `HaltForToday()`: it suspends **all new entries for the rest of the local day** and schedules a resume at **tomorrow's session open** (`InpSessionStartHour`, i.e. the Sydney/Tokyo open). Trading auto-resumes then and the martingale ladder resets to step 0. This caps the worst-case daily loss to a single completed martingale cycle.
 
 ---
 
@@ -598,6 +585,8 @@ A strategic assessment of the combined three-engine strategy and its v6.00 trade
 - **Short time-in-market** inherently limits exposure to drift, spread creep, and adverse news.
 - **Forced-M1 coherence:** range, candle, and PPM now describe the same minute, removing timeframe mismatch.
 - **Automated execution:** built-in entry, SL/TP, and trailing stop with auto per-symbol profiles (XAU/USD, EUR/USD).
+- **Bounded daily risk:** a maxed martingale cycle halts trading until the next Asian session, capping worst-case daily loss.
+- **Session discipline:** UTC+7 window plus per-symbol spread/slippage filters keep entries in liquid, low-cost hours.
 
 ### Weaknesses
 
@@ -660,6 +649,7 @@ Trading: OFF  Magic:202506
 TP:6 SL:8 Trail:5/3 pips
 Open:0  Mart:0/5 
 ADR:82 pips  Re-entry@8 pips
+Session: OPEN (UTC+7 5h-24h)  Spread<=15
 ```
 
 The Experts journal also receives one `Print()` line per new bar with the candle type, trend, OHLC, and current PPM + zone.
@@ -754,24 +744,7 @@ Actual signal counts depend on symbol volatility and session — establish per-s
 - [MQL4 Reference — EventSetMillisecondTimer](https://docs.mql4.com/eventfunctions/eventsetmillisecondtimer)
 - [MQL4 Reference — CopyRates](https://docs.mql4.com/series/copyrates)
 - [MQL4 Reference — iCustom](https://docs.mql4.com/indicators/icustom)
-- [MQL5 Article — Analyzing Candlestick Patterns](https://www.mql5.com/en/articles/101)
 - [MQL4 Reference — ENUM_TIMEFRAMES](https://docs.mql4.com/constants/chartconstants/enum_timeframes)
-
----
-
-## Version History
-
-**v6.00** (current)
-- Forced 1-minute context: range, candle recognizer, new-bar guard, and PPM all pinned to `PERIOD_M1`
-- Added a trade module: confluence entry, fixed SL/TP, trailing stop, and auto per-symbol profiles (XAU/USD, EUR/USD)
-- Added ADR-spaced martingale re-entry (`InpUseMartingale`, `InpMartMult`, `InpMartMaxSteps`, `InpAdrPeriod`, `InpAdrFraction`)
-- Data-model class diagram + trade-execution sequence diagram; documentation limited to UML class/sequence diagrams
-
-**v5.00**
-- Unified single-EA design: Range Scanner + Candlestick Recognizer + PPM Efficiency engine share one event loop and one `Comment()` panel
-- PPM engine added (`CalcPPM`, `PPM_RESULT`, `PPM_ZONE`) using the standard M1 ZigZag via `iCustom`
-- Broker-agnostic pip normalization and ATR-multiple readout
-- Documentation harmonized to match the shipped code
 
 ---
 
