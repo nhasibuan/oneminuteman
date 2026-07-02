@@ -5,9 +5,9 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/oneminuteman"
-#property version   "6.00"
+#property version   "7.00"
 #property strict
-#property description "OneMinuteMan: forced-M1 range + candle + PPM engine with trade execution, trailing stop, TP, and ADR-spaced martingale"
+#property description "OneMinuteMan: forced-M1 range + candle + PPM engine with virtual hidden SL, volume filter, trailing stop, TP, and ADR-spaced martingale"
 
 //==================================================================
 // SECTION 0 — INPUTS
@@ -26,6 +26,10 @@ input double InpPpmMinHigh  = 2.0;   // PPM threshold — below this is low effi
 input double InpPpmTarget   = 4.0;   // PPM target — ideal entry zone
 input double InpAtrDailyRef = 1.5;   // ATR M1 daily baseline in pips (default 1.5)
 input bool   InpShowPPM     = true;  // Show PPM panel in Comment()
+//--- Volume Filter
+input bool   InpUseVolumeFilter = true;  // Enable volume spike filter
+input int    InpVolLookback     = 20;    // Bars for average volume calculation
+input double InpVolMultiplier   = 1.5;   // Volume must be >= this x average to allow entry
 //--- Trade Management (order execution)
 input bool   InpEnableTrading = false;  // Master switch: allow live order execution
 input double InpBaseLots      = 0.01;   // Base lot size for the first entry
@@ -34,10 +38,11 @@ input int    InpMaxSpread     = 0;      // Max spread to allow entry (points); 0
 input int    InpMagic         = 202506; // Magic number (position tag)
 input double InpTP_Pips       = 0;      // Take profit (pips); 0 = auto per symbol
 input double InpSL_Pips       = 0;      // Stop loss (pips); 0 = auto per symbol
+input bool   InpHideSL        = true;   // Hide SL from broker terminal (virtual SL)
 input double InpTrailStart    = 0;      // Trailing activation (pips); 0 = auto
 input double InpTrailStep     = 0;      // Trailing distance (pips); 0 = auto
 //--- Martingale Re-entry (ADR-spaced)
-input bool   InpUseMartingale = true;   // Re-open after a loss (martingale)
+input bool   InpUseMartingale = true;   // Re-open after a loss (martingale, SAME direction)
 input double InpMartMult      = 2.0;    // Lot multiplier per martingale step
 input int    InpMartMaxSteps  = 5;      // Max martingale steps per cycle
 input int    InpAdrPeriod     = 14;     // ADR averaging period (days)
@@ -50,7 +55,8 @@ input int    InpSessionEndHour   = 24;  // Local hour to stop opening trades (24
 //==================================================================
 // SECTION 1 — CONSTANTS & BUFFER
 //==================================================================
-#define BUFFER_SIZE 1202
+#define BUFFER_SIZE   1202
+#define MAX_POSITIONS 20      // max simultaneous tracked virtual SL positions
 
 //==================================================================
 // SECTION 2 — ENUMERATIONS
@@ -115,6 +121,15 @@ struct PPM_RESULT
    datetime pivot_end;    // End pivot time (most recent)
 };
 
+// Virtual SL tracker — one entry per open position
+struct VSL_ENTRY
+{
+   int    ticket;
+   int    dir;        // +1 buy, -1 sell
+   double vsl_price;  // virtual stop loss price level
+   bool   active;
+};
+
 //==================================================================
 // SECTION 4 — GLOBAL STATE
 //==================================================================
@@ -137,6 +152,9 @@ static bool    g_await_reentry = false;
 static double  g_adr_pips      = 0.0;
 static datetime g_halt_until     = 0;
 static bool     g_trading_halted = false;
+//--- Virtual SL tracker
+static VSL_ENTRY g_vsl[MAX_POSITIONS];
+static int       g_vsl_count = 0;
 
 //==================================================================
 // SECTION 5 — UTILITY: TIMEFRAME LABEL
@@ -244,7 +262,7 @@ bool RecognizeCandle(const string sym, const ENUM_TIMEFRAMES per,
    if(res.type == CAND_SHORT &&
       res.shade_low > res.bodysize && res.shade_high > res.bodysize)                       res.type = CAND_SPINNING_TOP;
 
-   // Doji sub-classification: refine a detected Doji by shadow distribution
+   // Doji sub-classification
    if(res.type == CAND_DOJI)
    {
       double rng  = res.high - res.low;
@@ -281,7 +299,6 @@ bool CalcPPM(PPM_RESULT &res)
    int bars = MathMin(InpZzLookback, Bars - 1);
    if(bars < 4) return false;
 
-   // Collect two most recent distinct ZigZag pivots (non-zero iCustom values)
    double pivot1 = 0.0, pivot2 = 0.0;
    int    bar1   = -1,  bar2   = -1;
 
@@ -300,7 +317,7 @@ bool CalcPPM(PPM_RESULT &res)
    if(bar1 < 0 || bar2 < 0) return false;
 
    double priceDist = MathAbs(pivot1 - pivot2);
-   int    barDiff   = bar2 - bar1;  // M1 candles between pivots
+   int    barDiff   = bar2 - bar1;
    if(barDiff < 1) return false;
 
    double pipSize = (Digits == 3 || Digits == 5) ? Point * 10 : Point;
@@ -368,7 +385,7 @@ string TrendName(TYPE_TREND u)
 }
 
 //==================================================================
-// SECTION 13 — TRADE MODULE (orders, trailing stop, ADR martingale)
+// SECTION 13 — TRADE MODULE (orders, virtual SL, trailing, ADR martingale)
 //==================================================================
 double PipSize()
 {
@@ -384,15 +401,14 @@ double PipToPrice(double pips)
 void GetSymbolProfile(double &tp, double &sl, double &trailStart, double &trailStep)
 {
    string s = Symbol();
-   if(StringFind(s, "XAU") >= 0)                                  // Gold (pip = 0.01)
+   if(StringFind(s, "XAU") >= 0)                                   // Gold (pip = 0.01)
       { tp = 150; sl = 250; trailStart = 100; trailStep = 50; }
-   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0) // EUR/USD
+   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0)  // EUR/USD
       { tp = 6;   sl = 8;   trailStart = 5;   trailStep = 3;  }
-   else                                                            // generic FX
+   else                                                             // generic FX
       { tp = 10;  sl = 15;  trailStart = 8;   trailStep = 5;  }
 }
 
-// Effective params: explicit input overrides, else per-symbol auto profile
 void ResolveTradeParams(double &tp, double &sl, double &trailStart, double &trailStep)
 {
    double atp, asl, ats, atstep;
@@ -404,14 +420,16 @@ void ResolveTradeParams(double &tp, double &sl, double &trailStart, double &trai
 }
 
 // Per-symbol execution defaults: slippage & max allowed spread (points)
+// XAU/USD: slippage 30 pts (~0.30 price), max spread 50 pts (~0.50 price)
+// EUR/USD: slippage 5 pts, max spread 15 pts
 void GetSymbolExec(int &slippage, int &maxSpread)
 {
    string s = Symbol();
-   if(StringFind(s, "XAU") >= 0)                                  // Gold
+   if(StringFind(s, "XAU") >= 0)
       { slippage = 30; maxSpread = 50; }
-   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0) // EUR/USD
+   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0)
       { slippage = 5;  maxSpread = 15; }
-   else                                                            // generic FX
+   else
       { slippage = 10; maxSpread = 25; }
 }
 
@@ -434,13 +452,11 @@ bool SpreadOK()
    return (mx <= 0 || spr <= mx);
 }
 
-// Local time = broker GMT + configured offset (UTC+7 by default)
 datetime LocalNow()
 {
    return (datetime)(TimeGMT() + InpTzOffsetHours * 3600);
 }
 
-// True while inside the daily trading window (local hours)
 bool InSession()
 {
    int hr   = TimeHour(LocalNow());
@@ -448,28 +464,25 @@ bool InSession()
    return (hr >= InpSessionStartHour && hr < endh);
 }
 
-// Stop trading for the rest of the local day; resume tomorrow at session open
 void HaltForToday()
 {
    datetime loc      = LocalNow();
    datetime dayStart = loc - (loc % 86400);
-   g_halt_until      = dayStart + 86400 + InpSessionStartHour * 3600;  // tomorrow @ session open (local)
+   g_halt_until      = dayStart + 86400 + InpSessionStartHour * 3600;
    g_trading_halted  = true;
    Print("Martingale cycle maxed -> halt until next session open (local ", TimeToString(g_halt_until), ")");
 }
 
-// Combined gate: within session, not halted for the day
 bool TradingWindowOpen()
 {
    if(g_trading_halted)
    {
-      if(LocalNow() >= g_halt_until) g_trading_halted = false;  // new day/session -> resume
+      if(LocalNow() >= g_halt_until) g_trading_halted = false;
       else                           return false;
    }
    return InSession();
 }
 
-// Average Daily Range over InpAdrPeriod days, expressed in pips
 double CalcADR()
 {
    double sum = 0.0; int cnt = 0;
@@ -493,6 +506,29 @@ double NormalizeLots(double lots)
    if(lots < minlot) lots = minlot;
    if(lots > maxlot) lots = maxlot;
    return NormalizeDouble(lots, 2);
+}
+
+//------------------------------------------------------------------
+// VOLUME FILTER: returns true if last closed M1 bar volume >= multiplier x avg
+//------------------------------------------------------------------
+bool VolumeOK()
+{
+   if(!InpUseVolumeFilter) return true;
+   if(InpVolLookback < 2)  return true;
+
+   long vol_last = iVolume(Symbol(), PERIOD_M1, 1);
+   if(vol_last <= 0) return true;  // no volume data — pass through
+
+   long vol_sum = 0;
+   int  n       = 0;
+   for(int i = 1; i <= InpVolLookback; i++)
+   {
+      long v = iVolume(Symbol(), PERIOD_M1, i);
+      if(v > 0) { vol_sum += v; n++; }
+   }
+   if(n == 0) return true;
+   double vol_avg = (double)vol_sum / n;
+   return (vol_last >= vol_avg * InpVolMultiplier);
 }
 
 // Signal direction from candle: +1 long, -1 short, 0 none
@@ -533,6 +569,64 @@ double LastClosedProfit()
    return prof;
 }
 
+//------------------------------------------------------------------
+// VIRTUAL SL MANAGEMENT
+// If InpHideSL=true, orders are sent with SL=0 (hidden from broker terminal).
+// The EA tracks virtual SL levels internally and closes positions manually
+// when price crosses the threshold — fully invisible to the broker.
+//------------------------------------------------------------------
+void VslRegister(int ticket, int dir, double vslPrice)
+{
+   for(int i = 0; i < g_vsl_count; i++)
+   {
+      if(g_vsl[i].ticket == ticket) { g_vsl[i].vsl_price = vslPrice; return; }
+   }
+   if(g_vsl_count >= MAX_POSITIONS) return;
+   g_vsl[g_vsl_count].ticket    = ticket;
+   g_vsl[g_vsl_count].dir       = dir;
+   g_vsl[g_vsl_count].vsl_price = vslPrice;
+   g_vsl[g_vsl_count].active    = true;
+   g_vsl_count++;
+}
+
+void VslRemove(int ticket)
+{
+   for(int i = 0; i < g_vsl_count; i++)
+   {
+      if(g_vsl[i].ticket == ticket)
+      {
+         for(int j = i; j < g_vsl_count - 1; j++) g_vsl[j] = g_vsl[j+1];
+         g_vsl_count--;
+         return;
+      }
+   }
+}
+
+// Check all registered virtual SLs; close positions that have breached threshold
+void VslCheck()
+{
+   if(!InpHideSL) return;
+   for(int i = g_vsl_count - 1; i >= 0; i--)
+   {
+      if(!g_vsl[i].active) continue;
+      bool triggered = false;
+      if(g_vsl[i].dir > 0 && Bid <= g_vsl[i].vsl_price) triggered = true;  // buy hit SL
+      if(g_vsl[i].dir < 0 && Ask >= g_vsl[i].vsl_price) triggered = true;  // sell hit SL
+      if(!triggered) continue;
+
+      if(OrderSelect(g_vsl[i].ticket, SELECT_BY_TICKET))
+      {
+         if(OrderCloseTime() == 0)  // still open
+         {
+            double closePrice = (g_vsl[i].dir > 0) ? Bid : Ask;
+            if(!OrderClose(g_vsl[i].ticket, OrderLots(), closePrice, EffSlippage(), clrOrange))
+               Print("VslCheck: OrderClose failed ticket=", g_vsl[i].ticket, " err=", GetLastError());
+         }
+      }
+      VslRemove(g_vsl[i].ticket);
+   }
+}
+
 bool OpenTrade(int dir, double lots)
 {
    double tp, sl, ts, tstep;
@@ -547,15 +641,26 @@ bool OpenTrade(int dir, double lots)
    double tpPrice = (dir > 0) ? price + tpDist : price - tpDist;
    int    type    = (dir > 0) ? OP_BUY : OP_SELL;
 
+   // When hiding SL: send 0 for stop loss in the order; track internally.
+   double orderSL = InpHideSL ? 0.0 : NormalizeDouble(slPrice, Digits);
+
    int ticket = OrderSend(Symbol(), type, lots, NormalizeDouble(price, Digits),
                           EffSlippage(),
-                          NormalizeDouble(slPrice, Digits),
+                          orderSL,
                           NormalizeDouble(tpPrice, Digits),
                           "OneMinuteMan", InpMagic, 0,
                           (dir > 0) ? clrBlue : clrRed);
    if(ticket < 0)
+   {
       Print("OrderSend failed: err=", GetLastError());
-   return (ticket >= 0);
+      return false;
+   }
+
+   // Register virtual SL regardless (used for trailing reference even if hidden)
+   if(InpHideSL)
+      VslRegister(ticket, dir, NormalizeDouble(slPrice, Digits));
+
+   return true;
 }
 
 void ManageTrailing()
@@ -575,8 +680,18 @@ void ManageTrailing()
          if(gained >= ts)
          {
             double newSL = NormalizeDouble(Bid - PipToPrice(tstep), Digits);
-            if(newSL > OrderStopLoss())
-               OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
+            if(InpHideSL)
+            {
+               // Update virtual SL upward for buys
+               for(int v = 0; v < g_vsl_count; v++)
+                  if(g_vsl[v].ticket == OrderTicket() && newSL > g_vsl[v].vsl_price)
+                     { g_vsl[v].vsl_price = newSL; break; }
+            }
+            else
+            {
+               if(newSL > OrderStopLoss())
+                  OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
+            }
          }
       }
       else if(OrderType() == OP_SELL)
@@ -585,8 +700,17 @@ void ManageTrailing()
          if(gained >= ts)
          {
             double newSL = NormalizeDouble(Ask + PipToPrice(tstep), Digits);
-            if(OrderStopLoss() == 0.0 || newSL < OrderStopLoss())
-               OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
+            if(InpHideSL)
+            {
+               for(int v = 0; v < g_vsl_count; v++)
+                  if(g_vsl[v].ticket == OrderTicket() && (g_vsl[v].vsl_price == 0.0 || newSL < g_vsl[v].vsl_price))
+                     { g_vsl[v].vsl_price = newSL; break; }
+            }
+            else
+            {
+               if(OrderStopLoss() == 0.0 || newSL < OrderStopLoss())
+                  OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
+            }
          }
       }
    }
@@ -603,9 +727,8 @@ void UpdateTradeState()
          g_await_reentry = true;
       else
       {
-         // Cycle ended: a win, or the martingale ladder hit its max step
          if(profit < 0.0 && InpUseMartingale && g_mart_step >= InpMartMaxSteps)
-            HaltForToday();   // max steps completed -> stop trading for today
+            HaltForToday();
          g_await_reentry = false;
          g_mart_step     = 0;
       }
@@ -613,24 +736,27 @@ void UpdateTradeState()
    g_had_pos = (n > 0);
 }
 
-// Fresh entries + ADR-spaced martingale re-entry
+// Fresh entries + ADR-spaced martingale re-entry (SAME direction as losing trade)
 void ManageEntries(bool allowFresh)
 {
    if(!InpEnableTrading)    return;
    if(CountPositions() > 0) return;
-   if(!TradingWindowOpen()) return;   // session window + daily halt gate
-   if(!SpreadOK())          return;   // spread filter
+   if(!TradingWindowOpen()) return;
+   if(!SpreadOK())          return;
 
-   // Martingale re-entry: same direction, after adverse move >= fraction of ADR
+   // Martingale re-entry: SAME direction as the losing trade,
+   // after price has moved adversely by >= InpAdrFraction x ADR pips.
+   // NOTE: g_adr_pips is pre-fetched each timer tick; guarded against zero.
    if(g_await_reentry && InpUseMartingale && g_mart_step < InpMartMaxSteps)
    {
-      double reentry = InpAdrFraction * g_adr_pips;   // pips
+      double adr = (g_adr_pips > 0.0) ? g_adr_pips : CalcADR();  // fallback if timer hasn't fired yet
+      double reentry = InpAdrFraction * adr;
       double adverse = (g_last_dir > 0) ? (g_last_entry - Bid) / PipSize()
                                         : (Ask - g_last_entry) / PipSize();
       if(reentry > 0.0 && adverse >= reentry)
       {
          double lots = NormalizeLots(g_last_lots * InpMartMult);
-         if(OpenTrade(g_last_dir, lots))
+         if(OpenTrade(g_last_dir, lots))  // same direction — doubling down
          {
             g_mart_step++;
             g_last_lots     = lots;
@@ -641,10 +767,11 @@ void ManageEntries(bool allowFresh)
       return;
    }
 
-   // Fresh signal (once per new M1 bar): PPM efficiency gate + candle direction
+   // Fresh signal (once per new M1 bar): PPM efficiency gate + candle + volume
    if(!allowFresh)                     return;
    if(!g_candle_valid || !g_ppm_valid) return;
    if(g_ppm.zone < PPM_ZONE_MEDIUM)    return;
+   if(!VolumeOK())                     return;  // volume spike filter
 
    int dir = SignalDirection(g_candle);
    if(dir == 0) return;
@@ -666,7 +793,7 @@ void ManageEntries(bool allowFresh)
 void UpdateComment()
 {
    string tf  = TFLabel();
-   string msg = "=== OneMinuteMan v5.00 ===\n";
+   string msg = "=== OneMinuteMan v7.00 ===\n";
    msg += StringFormat("Symbol:%-6s  Engines:M1 (forced)  Chart:%s\n", Symbol(), tf);
 
    // --- Range panel
@@ -719,18 +846,34 @@ void UpdateComment()
          msg += "Calculating PPM...\n";
    }
 
-   // --- Trade panel (M1 engine)
+   // --- Volume filter status
+   if(InpUseVolumeFilter)
+   {
+      long vol_last = iVolume(Symbol(), PERIOD_M1, 1);
+      long vol_sum  = 0; int vn = 0;
+      for(int i = 1; i <= InpVolLookback; i++) { long v = iVolume(Symbol(), PERIOD_M1, i); if(v>0){vol_sum+=v;vn++;} }
+      double vol_avg = (vn > 0) ? (double)vol_sum / vn : 0.0;
+      msg += StringFormat("--- Volume Filter ---\nVol(last):%d  Avg:%d  Req:x%.1f  %s\n",
+                          (int)vol_last, (int)vol_avg, InpVolMultiplier,
+                          VolumeOK() ? "[PASS]" : "[SUPPRESS]");
+   }
+
+   // --- Trade panel
    msg += "--- Trade / Money Mgmt ---\n";
    {
       double tp, sl, ts, tstep; ResolveTradeParams(tp, sl, ts, tstep);
-      msg += StringFormat("Trading: %s  Magic:%d\n", InpEnableTrading ? "ON" : "OFF", InpMagic);
+      msg += StringFormat("Trading: %s  Magic:%d  HideSL:%s\n",
+                          InpEnableTrading ? "ON" : "OFF", InpMagic,
+                          InpHideSL ? "ON" : "OFF");
       msg += StringFormat("TP:%.0f SL:%.0f Trail:%.0f/%.0f pips\n", tp, sl, ts, tstep);
    }
    msg += StringFormat("Open:%d  Mart:%d/%d %s\n",
                        CountPositions(), g_mart_step, InpMartMaxSteps,
                        g_await_reentry ? "[AWAIT RE-ENTRY]" : "");
-   msg += StringFormat("ADR:%.0f pips  Re-entry@%.0f pips\n",
+   msg += StringFormat("ADR:%.0f pips  Re-entry@%.0f pips (SAME dir)\n",
                        g_adr_pips, InpAdrFraction * g_adr_pips);
+   if(InpHideSL && g_vsl_count > 0)
+      msg += StringFormat("VSL tracking: %d position(s)\n", g_vsl_count);
    msg += StringFormat("Session: %s (UTC+%d %dh-%dh)  Spread<=%d\n",
                        (TradingWindowOpen() ? "OPEN" : (g_trading_halted ? "HALTED" : "CLOSED")),
                        InpTzOffsetHours, InpSessionStartHour, InpSessionEndHour, EffMaxSpread());
@@ -767,19 +910,30 @@ int OnInit()
       { Print("Error: InpSessionStartHour must be 0-23"); return INIT_PARAMETERS_INCORRECT; }
    if(InpSessionEndHour < 1 || InpSessionEndHour > 24)
       { Print("Error: InpSessionEndHour must be 1-24"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpUseVolumeFilter && InpVolLookback < 2)
+      { Print("Error: InpVolLookback must be >= 2"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpUseVolumeFilter && InpVolMultiplier <= 0.0)
+      { Print("Error: InpVolMultiplier must be > 0"); return INIT_PARAMETERS_INCORRECT; }
 
    ArrayResize(g_prices, BUFFER_SIZE);
    ArrayInitialize(g_prices, 0.0);
+   g_vsl_count = 0;
+
+   // Pre-load ADR so martingale spacing is available from the first tick
+   g_adr_pips = CalcADR();
 
    if(!EventSetMillisecondTimer(InpSampleMs))
       { Print("Error: EventSetMillisecondTimer failed"); return INIT_FAILED; }
 
-   Print("OneMinuteMan v6.00 initialized: ", Symbol(), " (engines forced to M1)",
+   Print("OneMinuteMan v7.00 initialized: ", Symbol(), " (engines forced to M1)",
          " | ZZ:", InpZzDepth, "-", InpZzDeviation, "-", InpZzBackstep,
          " | PPM min:", InpPpmMinHigh, " target:", InpPpmTarget,
+         " | HideSL:", (InpHideSL ? "ON" : "OFF"),
+         " | VolFilter:", (InpUseVolumeFilter ? "ON" : "OFF"),
          " | Trading:", (InpEnableTrading ? "ON" : "OFF"),
          " Martingale:", (InpUseMartingale ? "ON" : "OFF"),
-         " | Session UTC+", InpTzOffsetHours, " ", InpSessionStartHour, "h-", InpSessionEndHour, "h");
+         " | Session UTC+", InpTzOffsetHours, " ", InpSessionStartHour, "h-", InpSessionEndHour, "h",
+         " | ADR=", g_adr_pips, " pips");
    return INIT_SUCCEEDED;
 }
 
@@ -787,23 +941,19 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    Comment("");
-   Print("OneMinuteMan v6.00 stopped. Reason: ", reason);
+   Print("OneMinuteMan v7.00 stopped. Reason: ", reason);
 }
 
-// Timer: runs every InpSampleMs — samples Ask, updates rolling range + PPM
 void OnTimer()
 {
    RefreshRates();
 
-   // Write Ask to circular buffer
    g_prices[g_head] = Ask;
    g_count = MathMin(g_count + 1, InpWindowSize);
    g_head  = (g_head + 1) % InpWindowSize;
 
-   // Update rolling range
    ScanHighLow();
 
-   // Refresh PPM on every timer tick (lightweight ZZ scan)
    PPM_RESULT ppmTmp;
    if(CalcPPM(ppmTmp))
    {
@@ -811,18 +961,15 @@ void OnTimer()
       g_ppm_valid = true;
    }
 
-   // Refresh ADR (used by martingale spacing + panel) and manage open trades
    g_adr_pips = CalcADR();
    ManageTrailing();
+   VslCheck();     // enforce virtual SL on every timer tick for fast response
 
    UpdateComment();
 }
 
-// Tick: fires on each new price quote — recognizes last closed bar pattern
 void OnTick()
 {
-   // Forced M1 context: candle engine always reads the M1 timeframe,
-   // matching the M1 PPM engine and the 60s rolling range.
    bool newBar = IsNewBar();
 
    if(newBar)
@@ -835,19 +982,20 @@ void OnTick()
          g_candle       = bar;
          g_candle_valid = true;
 
-         Print(StringFormat("[M1] Candle:%s Trend:%s | Body=%.5f OHLC=%.5f/%.5f/%.5f/%.5f | PPM=%.2f Zone=%s",
+         Print(StringFormat("[M1] Candle:%s Trend:%s | Body=%.5f OHLC=%.5f/%.5f/%.5f/%.5f | PPM=%.2f Zone=%s | Vol:%s",
                CandleTypeName(bar.type),
                TrendName(bar.unit),
                bar.bodysize,
                bar.open, bar.high, bar.low, bar.close,
                g_ppm_valid ? g_ppm.ppm : 0.0,
-               g_ppm_valid ? PpmZoneName(g_ppm.zone) : "N/A"));
+               g_ppm_valid ? PpmZoneName(g_ppm.zone) : "N/A",
+               VolumeOK() ? "PASS" : "LOW"));
       }
    }
 
-   // Trade management: detect closed cycles, arm martingale, trail, and enter.
    UpdateTradeState();
    ManageTrailing();
+   VslCheck();     // also check on every tick for tight stop enforcement
    ManageEntries(newBar);
 }
 //+------------------------------------------------------------------+
