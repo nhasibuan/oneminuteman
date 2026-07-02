@@ -311,6 +311,8 @@ sequenceDiagram
 | `InpPpmTarget` | `4.0` | double | PPM target — at/above = HIGH (ideal entry zone). |
 | `InpAtrDailyRef` | `1.5` | double | ATR M1 baseline in pips; `atr_ratio = ppm / InpAtrDailyRef`. |
 | `InpShowPPM` | `true` | bool | Show/hide the PPM block in the `Comment()` panel. |
+| `InpUseVolumeFilter` | `false` | bool | Require above-average M1 tick volume on the last closed bar before a fresh entry. |
+| `InpVolLookback` | `20` | int, ≥ 1 | Bars used to average tick volume for the confirmation check. |
 
 ### Trade & Martingale Parameters
 
@@ -323,6 +325,7 @@ sequenceDiagram
 | `InpMagic` | `202506` | int | Magic number tagging this EA's positions. |
 | `InpTP_Pips` | `0` | double | Take profit (pips); `0` = auto per-symbol profile. |
 | `InpSL_Pips` | `0` | double | Stop loss (pips); `0` = auto per-symbol profile. |
+| `InpHiddenSL` | `false` | bool | Keep the SL virtual — `OrderSend` is sent with SL `0` and the level is monitored/enforced in code instead of shown in MT4. |
 | `InpTrailStart` | `0` | double | Trailing activation (pips); `0` = auto. |
 | `InpTrailStep` | `0` | double | Trailing distance behind price (pips); `0` = auto. |
 | `InpUseMartingale` | `true` | bool | Re-open in the same direction after a losing cycle. |
@@ -491,11 +494,19 @@ Order execution is gated by `InpEnableTrading` (**off by default**). When enable
 
 ### Entry
 
-A fresh position opens only when, on a **new M1 bar**: (1) PPM efficiency is at least `MEDIUM` (`g_ppm.zone >= PPM_ZONE_MEDIUM`), and (2) the candle yields a non-zero direction via `SignalDirection()` — Hammer → long, Inverted Hammer → short, or a Long/Marubozu body in the direction of the SMA trend. Size is `InpBaseLots`.
+A fresh position opens only when, on a **new M1 bar**: (1) PPM efficiency is at least `MEDIUM` (`g_ppm.zone >= PPM_ZONE_MEDIUM`), (2) the candle yields a non-zero direction via `SignalDirection()` — Hammer → long, Inverted Hammer → short, or a Long/Marubozu body in the direction of the SMA trend, and (3) if `InpUseVolumeFilter` is on, the volume confirmation passes. Size is `InpBaseLots`.
+
+### Volume-based entry confirmation
+
+When `InpUseVolumeFilter` is enabled, `VolumeConfirms()` reads M1 tick volume via `iVolume()` and requires the **last closed bar** (`shift 1`) to have volume **above the average** of the preceding `InpVolLookback` bars (shifts `2 … InpVolLookback+1`) — an above-average-participation filter that suppresses entries on thin, low-conviction bars. If fewer than one prior bar of history is available the check returns `false` (no entry). The live reading (`Vol`, `Avg`) and its `[CONFIRM]`/`[WAIT]` state are shown in the trade panel. When the filter is off, entries are unaffected.
 
 ### Trailing stop & take profit
 
 Stop loss and take profit are attached at entry from the resolved per-symbol pip distances. On every timer tick, once price has advanced `trailStart` pips in favor, the stop is trailed to `trailStep` pips behind price and is never loosened.
+
+### Hidden (virtual) stop loss
+
+When `InpHiddenSL` is enabled, `OpenTrade()` still computes the intended SL price but sends `OrderSend` with SL `0`, so **nothing appears in the MT4 terminal**. The intended level is stored in `g_hidden_sl_price` and enforced in code: `CheckHiddenSL()` runs each timer tick (after `ManageTrailing()`) and calls `OrderClose` at `Bid`/`Ask` once the level is breached (Bid ≤ level for a long, Ask ≥ level for a short). `ManageTrailing()` also trails the virtual level — updating `g_hidden_sl_price` instead of issuing `OrderModify` — so the trailing logic stays hidden too. `g_hidden_sl_price` is cleared when the EA is flat. All price math uses the broker-agnostic `PipSize()`/`PipToPrice()` normalization. With `InpHiddenSL` off, the visible broker-side SL behaves exactly as before. The EA holds at most one position, so a single global tracks the level.
 
 ### Suggested per-symbol settings
 
