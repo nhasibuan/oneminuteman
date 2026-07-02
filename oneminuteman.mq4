@@ -5,9 +5,9 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/oneminuteman"
-#property version   "5.00"
+#property version   "6.00"
 #property strict
-#property description "OneMinuteMan: M1 rolling Ask range + candlestick recognition + PPM efficiency engine"
+#property description "OneMinuteMan: forced-M1 range + candle + PPM engine with trade execution, trailing stop, TP, and ADR-spaced martingale"
 
 //==================================================================
 // SECTION 0 — INPUTS
@@ -26,6 +26,21 @@ input double InpPpmMinHigh  = 2.0;   // PPM threshold — below this is low effi
 input double InpPpmTarget   = 4.0;   // PPM target — ideal entry zone
 input double InpAtrDailyRef = 1.5;   // ATR M1 daily baseline in pips (default 1.5)
 input bool   InpShowPPM     = true;  // Show PPM panel in Comment()
+//--- Trade Management (order execution)
+input bool   InpEnableTrading = false;  // Master switch: allow live order execution
+input double InpBaseLots      = 0.01;   // Base lot size for the first entry
+input int    InpSlippage      = 5;      // Max slippage (points)
+input int    InpMagic         = 202506; // Magic number (position tag)
+input double InpTP_Pips       = 0;      // Take profit (pips); 0 = auto per symbol
+input double InpSL_Pips       = 0;      // Stop loss (pips); 0 = auto per symbol
+input double InpTrailStart    = 0;      // Trailing activation (pips); 0 = auto
+input double InpTrailStep     = 0;      // Trailing distance (pips); 0 = auto
+//--- Martingale Re-entry (ADR-spaced)
+input bool   InpUseMartingale = true;   // Re-open after a loss (martingale)
+input double InpMartMult      = 2.0;    // Lot multiplier per martingale step
+input int    InpMartMaxSteps  = 5;      // Max martingale steps per cycle
+input int    InpAdrPeriod     = 14;     // ADR averaging period (days)
+input double InpAdrFraction   = 0.10;   // Re-entry spacing = fraction of ADR
 
 //==================================================================
 // SECTION 1 — CONSTANTS & BUFFER
@@ -104,6 +119,14 @@ static CANDLE_STRUCTURE g_candle;
 static bool             g_candle_valid = false;
 static PPM_RESULT       g_ppm;
 static bool             g_ppm_valid    = false;
+//--- Trade state
+static bool    g_had_pos       = false;
+static int     g_last_dir      = 0;     // +1 long, -1 short
+static double  g_last_entry    = 0.0;
+static double  g_last_lots     = 0.0;
+static int     g_mart_step     = 0;
+static bool    g_await_reentry = false;
+static double  g_adr_pips      = 0.0;
 
 //==================================================================
 // SECTION 5 — UTILITY: TIMEFRAME LABEL
@@ -120,8 +143,9 @@ string TFLabel()
 //==================================================================
 bool IsNewBar()
 {
+   // Forced M1: fire once per M1 bar regardless of the chart timeframe.
    static datetime lastBarTime = 0;
-   datetime cur = iTime(Symbol(), _Period, 0);
+   datetime cur = iTime(Symbol(), PERIOD_M1, 0);
    if(cur != lastBarTime){ lastBarTime = cur; return true; }
    return false;
 }
@@ -318,13 +342,230 @@ string TrendName(TYPE_TREND u)
 }
 
 //==================================================================
-// SECTION 13 — DISPLAY: merged dual-panel + PPM overlay
+// SECTION 13 — TRADE MODULE (orders, trailing stop, ADR martingale)
+//==================================================================
+double PipSize()
+{
+   return (Digits == 3 || Digits == 5) ? Point * 10 : Point;
+}
+
+double PipToPrice(double pips)
+{
+   return pips * PipSize();
+}
+
+// Per-symbol recommended defaults (in EA "pips"). Auto-selected by symbol name.
+void GetSymbolProfile(double &tp, double &sl, double &trailStart, double &trailStep)
+{
+   string s = Symbol();
+   if(StringFind(s, "XAU") >= 0)                                  // Gold (pip = 0.01)
+      { tp = 150; sl = 250; trailStart = 100; trailStep = 50; }
+   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0) // EUR/USD
+      { tp = 6;   sl = 8;   trailStart = 5;   trailStep = 3;  }
+   else                                                            // generic FX
+      { tp = 10;  sl = 15;  trailStart = 8;   trailStep = 5;  }
+}
+
+// Effective params: explicit input overrides, else per-symbol auto profile
+void ResolveTradeParams(double &tp, double &sl, double &trailStart, double &trailStep)
+{
+   double atp, asl, ats, atstep;
+   GetSymbolProfile(atp, asl, ats, atstep);
+   tp         = (InpTP_Pips    > 0.0) ? InpTP_Pips    : atp;
+   sl         = (InpSL_Pips    > 0.0) ? InpSL_Pips    : asl;
+   trailStart = (InpTrailStart > 0.0) ? InpTrailStart : ats;
+   trailStep  = (InpTrailStep  > 0.0) ? InpTrailStep  : atstep;
+}
+
+// Average Daily Range over InpAdrPeriod days, expressed in pips
+double CalcADR()
+{
+   double sum = 0.0; int cnt = 0;
+   for(int i = 1; i <= InpAdrPeriod; i++)
+   {
+      double hi = iHigh(Symbol(), PERIOD_D1, i);
+      double lo = iLow(Symbol(),  PERIOD_D1, i);
+      if(hi > 0.0 && lo > 0.0) { sum += (hi - lo); cnt++; }
+   }
+   if(cnt == 0) return 0.0;
+   return (sum / cnt) / PipSize();
+}
+
+double NormalizeLots(double lots)
+{
+   double minlot = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxlot = MarketInfo(Symbol(), MODE_MAXLOT);
+   double step   = MarketInfo(Symbol(), MODE_LOTSTEP);
+   if(step <= 0.0) step = 0.01;
+   lots = MathFloor(lots / step) * step;
+   if(lots < minlot) lots = minlot;
+   if(lots > maxlot) lots = maxlot;
+   return NormalizeDouble(lots, 2);
+}
+
+// Signal direction from candle: +1 long, -1 short, 0 none
+int SignalDirection(const CANDLE_STRUCTURE &c)
+{
+   if(c.type == CAND_HAMMER)          return +1;   // bullish reversal
+   if(c.type == CAND_INVERTED_HAMMER) return -1;   // bearish reversal
+   if(c.unit == TREND_UPPER && (c.type == CAND_LONG || c.type == CAND_MARUBOZU)) return +1;
+   if(c.unit == TREND_DOWN  && (c.type == CAND_LONG || c.type == CAND_MARUBOZU)) return -1;
+   return 0;
+}
+
+int CountPositions()
+{
+   int n = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol() == Symbol() && OrderMagicNumber() == InpMagic &&
+         (OrderType() == OP_BUY || OrderType() == OP_SELL)) n++;
+   }
+   return n;
+}
+
+double LastClosedProfit()
+{
+   datetime best = 0; double prof = 0.0;
+   for(int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != InpMagic) continue;
+      if(OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+      if(OrderCloseTime() > best)
+         { best = OrderCloseTime(); prof = OrderProfit() + OrderSwap() + OrderCommission(); }
+   }
+   return prof;
+}
+
+bool OpenTrade(int dir, double lots)
+{
+   double tp, sl, ts, tstep;
+   ResolveTradeParams(tp, sl, ts, tstep);
+
+   double price   = (dir > 0) ? Ask : Bid;
+   double stopLvl = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
+   double slDist  = MathMax(PipToPrice(sl), stopLvl);
+   double tpDist  = MathMax(PipToPrice(tp), stopLvl);
+
+   double slPrice = (dir > 0) ? price - slDist : price + slDist;
+   double tpPrice = (dir > 0) ? price + tpDist : price - tpDist;
+   int    type    = (dir > 0) ? OP_BUY : OP_SELL;
+
+   int ticket = OrderSend(Symbol(), type, lots, NormalizeDouble(price, Digits),
+                          InpSlippage,
+                          NormalizeDouble(slPrice, Digits),
+                          NormalizeDouble(tpPrice, Digits),
+                          "OneMinuteMan", InpMagic, 0,
+                          (dir > 0) ? clrBlue : clrRed);
+   if(ticket < 0)
+      Print("OrderSend failed: err=", GetLastError());
+   return (ticket >= 0);
+}
+
+void ManageTrailing()
+{
+   double tp, sl, ts, tstep;
+   ResolveTradeParams(tp, sl, ts, tstep);
+   double ps = PipSize();
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != InpMagic) continue;
+
+      if(OrderType() == OP_BUY)
+      {
+         double gained = (Bid - OrderOpenPrice()) / ps;
+         if(gained >= ts)
+         {
+            double newSL = NormalizeDouble(Bid - PipToPrice(tstep), Digits);
+            if(newSL > OrderStopLoss())
+               OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
+         }
+      }
+      else if(OrderType() == OP_SELL)
+      {
+         double gained = (OrderOpenPrice() - Ask) / ps;
+         if(gained >= ts)
+         {
+            double newSL = NormalizeDouble(Ask + PipToPrice(tstep), Digits);
+            if(OrderStopLoss() == 0.0 || newSL < OrderStopLoss())
+               OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
+         }
+      }
+   }
+}
+
+// Detect a just-closed cycle and arm martingale after a loss
+void UpdateTradeState()
+{
+   int n = CountPositions();
+   if(n == 0 && g_had_pos)
+   {
+      double profit = LastClosedProfit();
+      if(profit < 0.0 && InpUseMartingale && g_mart_step < InpMartMaxSteps)
+         g_await_reentry = true;
+      else
+         { g_await_reentry = false; g_mart_step = 0; }
+   }
+   g_had_pos = (n > 0);
+}
+
+// Fresh entries + ADR-spaced martingale re-entry
+void ManageEntries(bool allowFresh)
+{
+   if(!InpEnableTrading)    return;
+   if(CountPositions() > 0) return;
+
+   // Martingale re-entry: same direction, after adverse move >= fraction of ADR
+   if(g_await_reentry && InpUseMartingale && g_mart_step < InpMartMaxSteps)
+   {
+      double reentry = InpAdrFraction * g_adr_pips;   // pips
+      double adverse = (g_last_dir > 0) ? (g_last_entry - Bid) / PipSize()
+                                        : (Ask - g_last_entry) / PipSize();
+      if(reentry > 0.0 && adverse >= reentry)
+      {
+         double lots = NormalizeLots(g_last_lots * InpMartMult);
+         if(OpenTrade(g_last_dir, lots))
+         {
+            g_mart_step++;
+            g_last_lots     = lots;
+            g_last_entry    = (g_last_dir > 0) ? Ask : Bid;
+            g_await_reentry = false;
+         }
+      }
+      return;
+   }
+
+   // Fresh signal (once per new M1 bar): PPM efficiency gate + candle direction
+   if(!allowFresh)                     return;
+   if(!g_candle_valid || !g_ppm_valid) return;
+   if(g_ppm.zone < PPM_ZONE_MEDIUM)    return;
+
+   int dir = SignalDirection(g_candle);
+   if(dir == 0) return;
+
+   double lots = NormalizeLots(InpBaseLots);
+   if(OpenTrade(dir, lots))
+   {
+      g_mart_step     = 1;
+      g_last_dir      = dir;
+      g_last_lots     = lots;
+      g_last_entry    = (dir > 0) ? Ask : Bid;
+      g_await_reentry = false;
+   }
+}
+
+//==================================================================
+// SECTION 14 — DISPLAY: merged range + candle + PPM + trade overlay
 //==================================================================
 void UpdateComment()
 {
    string tf  = TFLabel();
    string msg = "=== OneMinuteMan v5.00 ===\n";
-   msg += StringFormat("Symbol:%-6s  TF:%s\n", Symbol(), tf);
+   msg += StringFormat("Symbol:%-6s  Engines:M1 (forced)  Chart:%s\n", Symbol(), tf);
 
    // --- Range panel
    msg += "--- Range (1-min rolling) ---\n";
@@ -376,6 +617,19 @@ void UpdateComment()
          msg += "Calculating PPM...\n";
    }
 
+   // --- Trade panel (M1 engine)
+   msg += "--- Trade / Money Mgmt ---\n";
+   {
+      double tp, sl, ts, tstep; ResolveTradeParams(tp, sl, ts, tstep);
+      msg += StringFormat("Trading: %s  Magic:%d\n", InpEnableTrading ? "ON" : "OFF", InpMagic);
+      msg += StringFormat("TP:%.0f SL:%.0f Trail:%.0f/%.0f pips\n", tp, sl, ts, tstep);
+   }
+   msg += StringFormat("Open:%d  Mart:%d/%d %s\n",
+                       CountPositions(), g_mart_step, InpMartMaxSteps,
+                       g_await_reentry ? "[AWAIT RE-ENTRY]" : "");
+   msg += StringFormat("ADR:%.0f pips  Re-entry@%.0f pips\n",
+                       g_adr_pips, InpAdrFraction * g_adr_pips);
+
    Comment(msg);
 }
 
@@ -394,6 +648,14 @@ int OnInit()
       { Print("Error: ZigZag params must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
    if(InpZzBackstep >= InpZzDepth)
       { Print("Error: InpZzBackstep must be < InpZzDepth"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpBaseLots <= 0.0)
+      { Print("Error: InpBaseLots must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpUseMartingale && (InpMartMult < 1.0 || InpMartMaxSteps < 1))
+      { Print("Error: martingale needs InpMartMult >= 1.0 and InpMartMaxSteps >= 1"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpAdrPeriod < 1)
+      { Print("Error: InpAdrPeriod must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpAdrFraction <= 0.0)
+      { Print("Error: InpAdrFraction must be > 0"); return INIT_PARAMETERS_INCORRECT; }
 
    ArrayResize(g_prices, BUFFER_SIZE);
    ArrayInitialize(g_prices, 0.0);
@@ -401,9 +663,11 @@ int OnInit()
    if(!EventSetMillisecondTimer(InpSampleMs))
       { Print("Error: EventSetMillisecondTimer failed"); return INIT_FAILED; }
 
-   Print("OneMinuteMan v5.00 initialized: ", Symbol(), " ", TFLabel(),
+   Print("OneMinuteMan v6.00 initialized: ", Symbol(), " (engines forced to M1)",
          " | ZZ:", InpZzDepth, "-", InpZzDeviation, "-", InpZzBackstep,
-         " | PPM min:", InpPpmMinHigh, " target:", InpPpmTarget);
+         " | PPM min:", InpPpmMinHigh, " target:", InpPpmTarget,
+         " | Trading:", (InpEnableTrading ? "ON" : "OFF"),
+         " Martingale:", (InpUseMartingale ? "ON" : "OFF"));
    return INIT_SUCCEEDED;
 }
 
@@ -411,7 +675,7 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    Comment("");
-   Print("OneMinuteMan stopped. Reason: ", reason);
+   Print("OneMinuteMan v6.00 stopped. Reason: ", reason);
 }
 
 // Timer: runs every InpSampleMs — samples Ask, updates rolling range + PPM
@@ -435,30 +699,43 @@ void OnTimer()
       g_ppm_valid = true;
    }
 
+   // Refresh ADR (used by martingale spacing + panel) and manage open trades
+   g_adr_pips = CalcADR();
+   ManageTrailing();
+
    UpdateComment();
 }
 
 // Tick: fires on each new price quote — recognizes last closed bar pattern
 void OnTick()
 {
-   if(!IsNewBar()) return;
+   // Forced M1 context: candle engine always reads the M1 timeframe,
+   // matching the M1 PPM engine and the 60s rolling range.
+   bool newBar = IsNewBar();
 
-   CANDLE_STRUCTURE bar;
-   if(RecognizeCandle(Symbol(), (ENUM_TIMEFRAMES)_Period,
-                      iTime(Symbol(), _Period, 1),
-                      InpAverPeriod, bar))
+   if(newBar)
    {
-      g_candle       = bar;
-      g_candle_valid = true;
+      CANDLE_STRUCTURE bar;
+      if(RecognizeCandle(Symbol(), PERIOD_M1,
+                         iTime(Symbol(), PERIOD_M1, 1),
+                         InpAverPeriod, bar))
+      {
+         g_candle       = bar;
+         g_candle_valid = true;
 
-      Print(StringFormat("[%s] Candle:%s Trend:%s | Body=%.5f OHLC=%.5f/%.5f/%.5f/%.5f | PPM=%.2f Zone=%s",
-            TFLabel(),
-            CandleTypeName(bar.type),
-            TrendName(bar.unit),
-            bar.bodysize,
-            bar.open, bar.high, bar.low, bar.close,
-            g_ppm_valid ? g_ppm.ppm : 0.0,
-            g_ppm_valid ? PpmZoneName(g_ppm.zone) : "N/A"));
+         Print(StringFormat("[M1] Candle:%s Trend:%s | Body=%.5f OHLC=%.5f/%.5f/%.5f/%.5f | PPM=%.2f Zone=%s",
+               CandleTypeName(bar.type),
+               TrendName(bar.unit),
+               bar.bodysize,
+               bar.open, bar.high, bar.low, bar.close,
+               g_ppm_valid ? g_ppm.ppm : 0.0,
+               g_ppm_valid ? PpmZoneName(g_ppm.zone) : "N/A"));
+      }
    }
+
+   // Trade management: detect closed cycles, arm martingale, trail, and enter.
+   UpdateTradeState();
+   ManageTrailing();
+   ManageEntries(newBar);
 }
 //+------------------------------------------------------------------+

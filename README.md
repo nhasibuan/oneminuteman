@@ -4,7 +4,7 @@
 
 [![Platform](https://img.shields.io/badge/Platform-MetaTrader%204-blue)](https://www.metatrader4.com)
 [![Language](https://img.shields.io/badge/Language-MQL4-orange)](https://docs.mql4.com)
-[![Version](https://img.shields.io/badge/Version-5.00-green)](https://github.com/nhasibuan/oneminuteman)
+[![Version](https://img.shields.io/badge/Version-6.00-green)](https://github.com/nhasibuan/oneminuteman)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
 
 ---
@@ -22,6 +22,7 @@
 - [Data Dictionary](#data-dictionary)
 - [Candle Classification Rules](#candle-classification-rules)
 - [PPM Efficiency Engine](#ppm-efficiency-engine)
+- [Trade Management & Money Management](#trade-management--money-management)
 - [Strategy Synthesis](#strategy-synthesis)
 - [SWOT Analysis](#swot-analysis)
 - [On-Chart Panel](#on-chart-panel)
@@ -54,7 +55,7 @@ Manual traders monitoring short-term price action on MetaTrader 4 have no native
 
 #### Non-Goals
 
-- Does **not** place, modify, or close orders (scaffolding only)
+- Does **not** guarantee profit — the martingale re-entry can compound losses; use a hard equity stop (see [SWOT](#swot-analysis))
 - Does **not** implement multi-candle patterns (Engulfing, Harami, Star composites)
 - Does **not** draw chart objects/labels — all output is via `Comment()`
 - Does **not** support MQL5 / MetaTrader 5 natively (separate port required)
@@ -106,12 +107,12 @@ Manual traders monitoring short-term price action on MetaTrader 4 have no native
 **OneMinuteMan** is a single-file MQL4 Expert Advisor (`oneminuteman.mq4`) that merges **three independent engines** behind one event loop and one chart panel:
 
 1. **Range Scanner** — samples Ask every `InpSampleMs` (default 50 ms) into a circular buffer and continuously reports the rolling 1-minute high/low. Timeframe-independent (pure Ask sampling).
-2. **Candlestick Recognizer** — on each new bar open, classifies the just-closed bar of the **chart timeframe** into one of 7 named single-candle patterns with SMA trend context.
+2. **Candlestick Recognizer** — on each new **M1** bar open, classifies the just-closed M1 bar into one of 7 named single-candle patterns with SMA trend context.
 3. **PPM Efficiency Engine** — every timer tick, scans the two most recent **M1 ZigZag** pivots and computes *Pip-Per-Minute* efficiency, an ATR multiple, and a LOW/MEDIUM/HIGH entry zone.
 
-All three run concurrently through the standard MQL4 event handlers (`OnInit` / `OnTimer` / `OnTick` / `OnDeinit`) and publish their results into shared globals that are ready for trade-signal logic.
+All three run concurrently through the standard MQL4 event handlers (`OnInit` / `OnTimer` / `OnTick` / `OnDeinit`) and publish their results into shared globals (`g_high`, `g_low`, `g_candle`, `g_ppm`) that drive the built-in **trade module** — entry, trailing stop, take profit, and ADR-spaced martingale re-entry.
 
-> **Timeframe note:** the Range Scanner is TF-independent, the Candle Recognizer uses the **chart** timeframe (`_Period`), and the PPM engine is **hard-wired to `PERIOD_M1`**. Attach the EA to an **M1 chart** so all three engines describe the same 1-minute context.
+> **Forced 1-minute context (v6.00):** every engine is pinned to M1 regardless of the chart timeframe — the Range Scanner's 60 s rolling window, the Candle Recognizer (`RecognizeCandle` reads `PERIOD_M1`), the new-bar guard (`IsNewBar` tracks `PERIOD_M1`), and the PPM engine (`iCustom` on `PERIOD_M1`) all describe the same minute. Attaching to an M1 chart is still recommended so the on-chart visuals match.
 
 ---
 
@@ -127,6 +128,9 @@ All three run concurrently through the standard MQL4 event handlers (`OnInit` / 
 - Full input validation with `INIT_PARAMETERS_INCORRECT` guard
 - Broker-agnostic pip normalization (3/4/5-digit)
 - MQL4 strict-mode compliant — `(ENUM_TIMEFRAMES)_Period` cast for `EnumToString`
+- **Forced M1 context** — range, candle, new-bar guard, and PPM all pinned to `PERIOD_M1`
+- **Trade module** — confluence entry, fixed SL/TP, and a trailing stop with auto per-symbol profiles (XAU/USD, EUR/USD)
+- **ADR-spaced martingale** — re-opens after a losing cycle once price moves a fraction of the Average Daily Range
 
 ---
 
@@ -218,50 +222,9 @@ sequenceDiagram
     end
 ```
 
-### 3. Candle Recognition State Flow
+### 3. Candle Recognition (priority chain)
 
-```mermaid
-stateDiagram-v2
-    [*] --> RecognizeCandle
-    RecognizeCandle --> LoadData: CopyRates loads MqlRates array
-    LoadData --> Extract: Extract OHLC of last closed bar
-    Extract --> CalcAvg: CalcAverageClose - SMA trend baseline
-    CalcAvg --> CalcBody: CalcAverageBody - mean body size
-    CalcBody --> CalcShd: CalcShades - upper and lower shadows
-
-    CalcShd --> CheckLong: bodysize > avgBody x 1.3?
-    CheckLong --> CAND_LONG: Yes
-    CheckLong --> CheckShort: No
-
-    CheckShort --> CAND_SHORT: bodysize < avgBody x 0.5?
-    CheckShort --> KeepNone: No
-
-    CAND_SHORT --> CheckDoji: bodysize < HL x 0.03?
-    KeepNone --> CheckDoji
-    CAND_LONG --> CheckDoji
-    CheckDoji --> CAND_DOJI: Yes
-    CheckDoji --> CheckMarubozu: No
-
-    CAND_DOJI --> CheckMarubozu
-    CheckMarubozu --> CAND_MARUBOZU: Any shadow < body x 0.01?
-    CheckMarubozu --> CheckHammer: No
-
-    CAND_MARUBOZU --> CheckHammer
-    CheckHammer --> CAND_HAMMER: shade_low > body x 2 AND shade_high < body x 0.1?
-    CheckHammer --> CheckInverted: No
-
-    CAND_HAMMER --> CheckInverted
-    CheckInverted --> CAND_INVERTED_HAMMER: shade_low < body x 0.1 AND shade_high > body x 2?
-    CheckInverted --> CheckSpin: No
-
-    CAND_INVERTED_HAMMER --> CheckSpin
-    CheckSpin --> CAND_SPINNING_TOP: Current type is CAND_SHORT AND both shadows > body?
-    CheckSpin --> RetainType: No
-
-    CAND_SPINNING_TOP --> Return
-    RetainType --> Return
-    Return --> [*]: Return classified CANDLE_STRUCTURE
-```
+`RecognizeCandle()` loads the last closed M1 bar via `CopyRates`, then computes the body size, the upper/lower shadows (`CalcShades`), the SMA close (`CalcAverageClose`), and the mean body (`CalcAverageBody`). It applies the seven classification rules in priority order — later matches override earlier ones — starting from `CAND_LONG` / `CAND_SHORT` (body vs. average body), then `CAND_DOJI` (body vs. high-low range), `CAND_MARUBOZU` (near-zero shadow), `CAND_HAMMER` / `CAND_INVERTED_HAMMER` (shadow asymmetry), and finally `CAND_SPINNING_TOP` (a short body with both shadows larger than the body). Trend is assigned independently by comparing the close to the SMA (Ascending / Descending / Lateral). The full result is returned in a `CANDLE_STRUCTURE`. See [Candle Classification Rules](#candle-classification-rules) for the exact thresholds.
 
 ### 4. PPM Efficiency Dataflow
 
@@ -279,7 +242,85 @@ While running, the EA services two events: `OnTimer()` (sample Ask → `ScanHigh
 
 When the EA is removed or the terminal closes, `OnDeinit()` kills the timer and clears the chart comment, leaving no residual state.
 
+### 6. Data Model
 
+```mermaid
+classDiagram
+    class CANDLE_STRUCTURE {
+        +TYPE_CANDLESTICK type
+        +TYPE_TREND unit
+        +double bodysize
+        +double shade_high
+        +double shade_low
+        +double avg_close
+        +double avg_body
+        +double open
+        +double high
+        +double low
+        +double close
+    }
+    class PPM_RESULT {
+        +double ppm
+        +double pips
+        +int candles
+        +double atr_ratio
+        +PPM_ZONE zone
+        +datetime pivot_start
+        +datetime pivot_end
+    }
+    class TYPE_CANDLESTICK {
+        <<enumeration>>
+        CAND_UNKNOWN
+        CAND_LONG
+        CAND_SHORT
+        CAND_DOJI
+        CAND_MARUBOZU
+        CAND_HAMMER
+        CAND_INVERTED_HAMMER
+        CAND_SPINNING_TOP
+    }
+    class TYPE_TREND {
+        <<enumeration>>
+        TREND_UNKNOWN
+        TREND_UPPER
+        TREND_DOWN
+        TREND_LATERAL
+    }
+    class PPM_ZONE {
+        <<enumeration>>
+        PPM_ZONE_NONE
+        PPM_ZONE_LOW
+        PPM_ZONE_MEDIUM
+        PPM_ZONE_HIGH
+    }
+    CANDLE_STRUCTURE --> TYPE_CANDLESTICK : type
+    CANDLE_STRUCTURE --> TYPE_TREND : unit
+    PPM_RESULT --> PPM_ZONE : zone
+```
+
+### 7. Trade Execution & Martingale Flow
+
+```mermaid
+sequenceDiagram
+    participant Tick as OnTick
+    participant State as UpdateTradeState
+    participant Trail as ManageTrailing
+    participant Entry as ManageEntries
+    participant Broker
+
+    Tick->>State: count positions, detect closed cycle
+    State-->>Tick: arm martingale if last cycle lost
+    Tick->>Trail: tighten stop on open positions
+    Tick->>Entry: allowFresh = IsNewBar on M1
+    alt awaiting re-entry
+        Entry->>Entry: adverse move >= InpAdrFraction x ADR ?
+        Entry->>Broker: OrderSend same dir, lots x InpMartMult
+    else fresh signal
+        Entry->>Entry: PPM zone >= MEDIUM and candle dir not 0 ?
+        Entry->>Broker: OrderSend base lots
+    end
+    Broker-->>Tick: ticket or error
+```
 
 ---
 
@@ -312,6 +353,24 @@ When the EA is removed or the terminal closes, `OnDeinit()` kills the timer and 
 | `InpPpmTarget` | `4.0` | double | PPM target — at/above = HIGH (ideal entry zone). |
 | `InpAtrDailyRef` | `1.5` | double | ATR M1 baseline in pips; `atr_ratio = ppm / InpAtrDailyRef`. |
 | `InpShowPPM` | `true` | bool | Show/hide the PPM block in the `Comment()` panel. |
+
+### Trade & Martingale Parameters
+
+| Parameter | Default | Type | Description |
+|---|---|---|---|
+| `InpEnableTrading` | `false` | bool | Master switch — must be `true` to place any order. |
+| `InpBaseLots` | `0.01` | double | Base lot size for the first entry of a cycle. |
+| `InpSlippage` | `5` | int | Max slippage (points) on `OrderSend`. |
+| `InpMagic` | `202506` | int | Magic number tagging this EA's positions. |
+| `InpTP_Pips` | `0` | double | Take profit (pips); `0` = auto per-symbol profile. |
+| `InpSL_Pips` | `0` | double | Stop loss (pips); `0` = auto per-symbol profile. |
+| `InpTrailStart` | `0` | double | Trailing activation (pips); `0` = auto. |
+| `InpTrailStep` | `0` | double | Trailing distance behind price (pips); `0` = auto. |
+| `InpUseMartingale` | `true` | bool | Re-open in the same direction after a losing cycle. |
+| `InpMartMult` | `2.0` | double | Lot multiplier applied at each martingale step. |
+| `InpMartMaxSteps` | `5` | int | Max martingale re-entries per cycle. |
+| `InpAdrPeriod` | `14` | int | Days used to average the ADR. |
+| `InpAdrFraction` | `0.10` | double | Re-entry spacing = this fraction of ADR (pips). |
 
 > **Validation invariant:** `OnInit()` rejects configurations where `InpZzBackstep >= InpZzDepth`.
 
@@ -459,6 +518,42 @@ On M1, one candle ≈ one minute, so PPM is effectively **pips per minute**.
 
 ---
 
+## Trade Management & Money Management
+
+Order execution is gated by `InpEnableTrading` (**off by default**). When enabled, the EA holds at most one position at a time, opens on a confluence signal, protects it with a fixed stop, take profit, and trailing stop, and — if a cycle closes at a loss — re-opens in the same direction using an ADR-spaced martingale progression.
+
+### Entry
+
+A fresh position opens only when, on a **new M1 bar**: (1) PPM efficiency is at least `MEDIUM` (`g_ppm.zone >= PPM_ZONE_MEDIUM`), and (2) the candle yields a non-zero direction via `SignalDirection()` — Hammer → long, Inverted Hammer → short, or a Long/Marubozu body in the direction of the SMA trend. Size is `InpBaseLots`.
+
+### Trailing stop & take profit
+
+Stop loss and take profit are attached at entry from the resolved per-symbol pip distances. On every timer tick, once price has advanced `trailStart` pips in favor, the stop is trailed to `trailStep` pips behind price and is never loosened.
+
+### Suggested per-symbol settings
+
+Auto-selected by `GetSymbolProfile()`; override any value with the matching `Inp*` input. Values are in the EA's point-based pips — for a 2/3-digit Gold quote, 1 pip = `$0.01`.
+
+| Setting | EUR/USD | XAU/USD (Gold) |
+|---|---|---|
+| Base lot | 0.01 | 0.01 |
+| Take profit | 6 pips (`0.0006`) | 150 pips (`$1.50`) |
+| Stop loss | 8 pips (`0.0008`) | 250 pips (`$2.50`) |
+| Trailing start | 5 pips | 100 pips (`$1.00`) |
+| Trailing step | 3 pips | 50 pips (`$0.50`) |
+| Typical ADR | ~80 pips | ~2,500 pips (~`$25`) |
+| Re-entry spacing (10% ADR) | ~8 pips | ~250 pips (~`$2.50`) |
+
+> These are conservative M1-scalping starting points, **not** optimized values — backtest and forward-test per broker before risking capital.
+
+### Martingale re-entry (ADR-spaced)
+
+After a cycle closes at a loss and `InpUseMartingale` is on, the EA arms a re-entry. It waits until price has moved **against** the previous entry by at least `InpAdrFraction × ADR` pips — ADR is the Average Daily Range from `CalcADR()` over `InpAdrPeriod` days — then re-opens the **same** direction with `lots × InpMartMult`, up to `InpMartMaxSteps` times. A winning cycle resets the progression to step 0.
+
+> **Risk warning:** martingale increases exposure precisely when the strategy is losing. A sustained adverse run escalates lot size geometrically and can blow the account. Keep `InpBaseLots` tiny, cap `InpMartMaxSteps`, and never run it unattended without a hard equity/drawdown stop.
+
+---
+
 ## Strategy Synthesis
 
 The three engines are not three separate tools bolted together — they are three complementary questions about the *same* one-minute moment, and a trade only makes sense when all three answers agree. Inside `OnTick()` the globals `g_ppm`, `g_candle`, and `g_high` / `g_low` form a single decision surface; the "strategy" is simply the logic that reads them together rather than in isolation.
@@ -491,7 +586,7 @@ Capture a *single*, high-efficiency, roughly one-minute move. Enter only when ef
 
 ## SWOT Analysis
 
-A strategic assessment of the combined three-engine approach.
+A strategic assessment of the combined three-engine strategy and its v6.00 trade module.
 
 ### Strengths
 
@@ -501,14 +596,16 @@ A strategic assessment of the combined three-engine approach.
 - **Robust and portable:** `DBL_MAX` sentinels and 3/4/5-digit pip normalization make it instrument- and broker-agnostic.
 - **Single, clean decision surface:** all signals converge on shared globals in `OnTick()`, so order logic is trivial to layer on.
 - **Short time-in-market** inherently limits exposure to drift, spread creep, and adverse news.
+- **Forced-M1 coherence:** range, candle, and PPM now describe the same minute, removing timeframe mismatch.
+- **Automated execution:** built-in entry, SL/TP, and trailing stop with auto per-symbol profiles (XAU/USD, EUR/USD).
 
 ### Weaknesses
 
 - **ZigZag repaints:** the most recent leg — and therefore the live PPM — is provisional and can lure late entries.
 - **Single-bar patterns only:** no multi-bar confirmation (Engulfing, Harami, morning/evening stars).
 - **Coarse trend proxy:** an SMA-close comparison flags Lateral on equal closes and ignores slope/strength.
-- **Timeframe coupling:** PPM is hard-wired to `PERIOD_M1` while the candle engine follows the chart TF, so the edge is only coherent on M1.
-- **Scaffold, not a system:** no order, stop, or money-management logic ships in the box; execution quality is unproven.
+- **Unbounded martingale risk:** lot size grows geometrically after losses; without a hard equity stop a bad run can margin-call the account.
+- **Simple, fixed logic:** one position at a time, single-bar entry trigger, and static per-symbol pip targets — unproven without backtesting.
 - **Volatile, stateless memory:** buffers and PPM reset on restart, and the millisecond timer can drift under CPU load.
 
 ### Opportunities
@@ -518,6 +615,7 @@ A strategic assessment of the combined three-engine approach.
 - **Pivot confirmation:** wait for a ZigZag pivot to close before acting to cut repaint risk.
 - **Session & news gating:** suppress signals around NFP/FOMC and outside high-liquidity windows to protect PPM validity.
 - **Data-driven tuning:** log PPM per symbol to build statistical norms and optimize thresholds; enable backtesting.
+- **Risk guards:** add an equity/drawdown stop, daily loss limit, and martingale-off news blackout to contain tail risk.
 - **Reach:** an MQL5/MT5 port plus push/mobile alerts for `HIGH [ENTER]` conditions.
 
 ### Threats
@@ -527,6 +625,7 @@ A strategic assessment of the combined three-engine approach.
 - **Liquidity gaps:** sparse pivots on illiquid symbols leave PPM stale or in `NO DATA`.
 - **Over-trading:** thresholds set too loosely invite churn in ranging conditions, bleeding costs.
 - **Microstructure & competition:** M1 noise and faster institutional algos disadvantage a discretionary/manual operator.
+- **Martingale ruin:** a trending market that keeps moving against the position chains re-entries into a margin call.
 - **Broker/regulatory limits:** some brokers restrict scalping or impose minimum holding times that break the model.
 
 ---
@@ -536,8 +635,8 @@ A strategic assessment of the combined three-engine approach.
 All three engines render into a single non-blocking `Comment()` overlay (no chart objects, no popups). Example:
 
 ```text
-=== OneMinuteMan v5.00 ===
-Symbol:EURUSD  TF:M1
+=== OneMinuteMan v6.00 ===
+Symbol:EURUSD  Engines:M1 (forced)  Chart:M1
 --- Range (1-min rolling) ---
 Window : 60 s (1200 samples @ 50 ms)
 Filled : 1200 / 1200
@@ -556,6 +655,11 @@ Pips   : 16.0  Candles: 5
 ATR x  : 2.1  (ATR ref: 1.5 pip)
 Zone   : MEDIUM [WATCH]
 Pivot  : 14:20  >>  14:25
+--- Trade / Money Mgmt ---
+Trading: OFF  Magic:202506
+TP:6 SL:8 Trail:5/3 pips
+Open:0  Mart:0/5 
+ADR:82 pips  Re-entry@8 pips
 ```
 
 The Experts journal also receives one `Print()` line per new bar with the candle type, trend, OHLC, and current PPM + zone.
@@ -657,7 +761,13 @@ Actual signal counts depend on symbol volatility and session — establish per-s
 
 ## Version History
 
-**v5.00** (current)
+**v6.00** (current)
+- Forced 1-minute context: range, candle recognizer, new-bar guard, and PPM all pinned to `PERIOD_M1`
+- Added a trade module: confluence entry, fixed SL/TP, trailing stop, and auto per-symbol profiles (XAU/USD, EUR/USD)
+- Added ADR-spaced martingale re-entry (`InpUseMartingale`, `InpMartMult`, `InpMartMaxSteps`, `InpAdrPeriod`, `InpAdrFraction`)
+- Data-model class diagram + trade-execution sequence diagram; documentation limited to UML class/sequence diagrams
+
+**v5.00**
 - Unified single-EA design: Range Scanner + Candlestick Recognizer + PPM Efficiency engine share one event loop and one `Comment()` panel
 - PPM engine added (`CalcPPM`, `PPM_RESULT`, `PPM_ZONE`) using the standard M1 ZigZag via `iCustom`
 - Broker-agnostic pip normalization and ATR-multiple readout
