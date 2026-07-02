@@ -34,8 +34,12 @@ input int    InpMaxSpread     = 0;      // Max spread to allow entry (points); 0
 input int    InpMagic         = 202506; // Magic number (position tag)
 input double InpTP_Pips       = 0;      // Take profit (pips); 0 = auto per symbol
 input double InpSL_Pips       = 0;      // Stop loss (pips); 0 = auto per symbol
+input bool   InpHiddenSL      = false;  // Hide SL from broker (virtual/monitored SL)
 input double InpTrailStart    = 0;      // Trailing activation (pips); 0 = auto
 input double InpTrailStep     = 0;      // Trailing distance (pips); 0 = auto
+//--- Volume-based entry confirmation
+input bool   InpUseVolumeFilter = false; // Require above-average tick volume to enter
+input int    InpVolLookback     = 20;    // Bars to average tick volume against
 //--- Martingale Re-entry (ADR-spaced)
 input bool   InpUseMartingale = true;   // Re-open after a loss (martingale)
 input double InpMartMult      = 2.0;    // Lot multiplier per martingale step
@@ -137,6 +141,7 @@ static bool    g_await_reentry = false;
 static double  g_adr_pips      = 0.0;
 static datetime g_halt_until     = 0;
 static bool     g_trading_halted = false;
+static double  g_hidden_sl_price = 0.0;  // Virtual SL level tracked when InpHiddenSL is on
 
 //==================================================================
 // SECTION 5 — UTILITY: TIMEFRAME LABEL
@@ -543,18 +548,24 @@ bool OpenTrade(int dir, double lots)
    double slDist  = MathMax(PipToPrice(sl), stopLvl);
    double tpDist  = MathMax(PipToPrice(tp), stopLvl);
 
-   double slPrice = (dir > 0) ? price - slDist : price + slDist;
+   double slPrice = NormalizeDouble((dir > 0) ? price - slDist : price + slDist, Digits);
    double tpPrice = (dir > 0) ? price + tpDist : price - tpDist;
    int    type    = (dir > 0) ? OP_BUY : OP_SELL;
 
+   // Hidden SL: send SL=0 to the broker (nothing shows in the terminal) and
+   // monitor the intended level ourselves via CheckHiddenSL().
+   double sendSL  = InpHiddenSL ? 0.0 : slPrice;
+
    int ticket = OrderSend(Symbol(), type, lots, NormalizeDouble(price, Digits),
                           EffSlippage(),
-                          NormalizeDouble(slPrice, Digits),
+                          sendSL,
                           NormalizeDouble(tpPrice, Digits),
                           "OneMinuteMan", InpMagic, 0,
                           (dir > 0) ? clrBlue : clrRed);
    if(ticket < 0)
       Print("OrderSend failed: err=", GetLastError());
+   else if(InpHiddenSL)
+      g_hidden_sl_price = slPrice;
    return (ticket >= 0);
 }
 
@@ -575,7 +586,12 @@ void ManageTrailing()
          if(gained >= ts)
          {
             double newSL = NormalizeDouble(Bid - PipToPrice(tstep), Digits);
-            if(newSL > OrderStopLoss())
+            if(InpHiddenSL)
+            {
+               // Trail the virtual SL only — nothing is sent to the broker.
+               if(newSL > g_hidden_sl_price) g_hidden_sl_price = newSL;
+            }
+            else if(newSL > OrderStopLoss())
                OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
          }
       }
@@ -585,11 +601,67 @@ void ManageTrailing()
          if(gained >= ts)
          {
             double newSL = NormalizeDouble(Ask + PipToPrice(tstep), Digits);
-            if(OrderStopLoss() == 0.0 || newSL < OrderStopLoss())
+            if(InpHiddenSL)
+            {
+               if(g_hidden_sl_price == 0.0 || newSL < g_hidden_sl_price) g_hidden_sl_price = newSL;
+            }
+            else if(OrderStopLoss() == 0.0 || newSL < OrderStopLoss())
                OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
          }
       }
    }
+}
+
+// Virtual SL monitor: closes an open position when Bid/Ask breaches the hidden
+// SL level stored in g_hidden_sl_price (only active when InpHiddenSL is on).
+void CheckHiddenSL()
+{
+   if(!InpHiddenSL || g_hidden_sl_price <= 0.0) return;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != InpMagic) continue;
+
+      if(OrderType() == OP_BUY && Bid <= g_hidden_sl_price)
+      {
+         if(!OrderClose(OrderTicket(), OrderLots(), NormalizeDouble(Bid, Digits),
+                        EffSlippage(), clrOrange))
+            Print("Hidden SL close (BUY) failed: err=", GetLastError());
+      }
+      else if(OrderType() == OP_SELL && Ask >= g_hidden_sl_price)
+      {
+         if(!OrderClose(OrderTicket(), OrderLots(), NormalizeDouble(Ask, Digits),
+                        EffSlippage(), clrOrange))
+            Print("Hidden SL close (SELL) failed: err=", GetLastError());
+      }
+   }
+}
+
+// Tick-volume confirmation stats: last closed M1 bar volume vs. the average of
+// the preceding InpVolLookback bars. Returns false when history is insufficient.
+bool VolumeStats(double &last, double &avg)
+{
+   last = 0.0; avg = 0.0;
+   int lb = (InpVolLookback < 1) ? 1 : InpVolLookback;
+   last = (double)iVolume(Symbol(), PERIOD_M1, 1);
+   double sum = 0.0; int cnt = 0;
+   for(int i = 2; i <= lb + 1; i++)
+   {
+      double v = (double)iVolume(Symbol(), PERIOD_M1, i);
+      if(v > 0.0) { sum += v; cnt++; }
+   }
+   if(cnt == 0) return false;
+   avg = sum / cnt;
+   return true;
+}
+
+// True when the last closed bar shows above-average participation.
+bool VolumeConfirms()
+{
+   double last, avg;
+   if(!VolumeStats(last, avg)) return false;
+   return (last > avg);
 }
 
 // Detect a just-closed cycle and arm martingale after a loss
@@ -610,6 +682,7 @@ void UpdateTradeState()
          g_mart_step     = 0;
       }
    }
+   if(n == 0) g_hidden_sl_price = 0.0;  // no position -> clear virtual SL
    g_had_pos = (n > 0);
 }
 
@@ -648,6 +721,9 @@ void ManageEntries(bool allowFresh)
 
    int dir = SignalDirection(g_candle);
    if(dir == 0) return;
+
+   // Volume confirmation: require above-average participation on the last bar
+   if(InpUseVolumeFilter && !VolumeConfirms()) return;
 
    double lots = NormalizeLots(InpBaseLots);
    if(OpenTrade(dir, lots))
@@ -724,7 +800,20 @@ void UpdateComment()
    {
       double tp, sl, ts, tstep; ResolveTradeParams(tp, sl, ts, tstep);
       msg += StringFormat("Trading: %s  Magic:%d\n", InpEnableTrading ? "ON" : "OFF", InpMagic);
-      msg += StringFormat("TP:%.0f SL:%.0f Trail:%.0f/%.0f pips\n", tp, sl, ts, tstep);
+      msg += StringFormat("TP:%.0f SL:%.0f Trail:%.0f/%.0f pips  SL:%s\n",
+                          tp, sl, ts, tstep, InpHiddenSL ? "HIDDEN" : "VISIBLE");
+      if(InpHiddenSL && g_hidden_sl_price > 0.0)
+         msg += StringFormat("HiddenSL@ %.5f\n", g_hidden_sl_price);
+   }
+   if(InpUseVolumeFilter)
+   {
+      double vlast, vavg;
+      if(VolumeStats(vlast, vavg))
+         msg += StringFormat("Vol:%.0f Avg:%.0f (%d) %s\n",
+                             vlast, vavg, InpVolLookback,
+                             (vlast > vavg) ? "[CONFIRM]" : "[WAIT]");
+      else
+         msg += StringFormat("Vol: n/a (need %d bars)\n", InpVolLookback);
    }
    msg += StringFormat("Open:%d  Mart:%d/%d %s\n",
                        CountPositions(), g_mart_step, InpMartMaxSteps,
@@ -757,6 +846,8 @@ int OnInit()
       { Print("Error: InpZzBackstep must be < InpZzDepth"); return INIT_PARAMETERS_INCORRECT; }
    if(InpBaseLots <= 0.0)
       { Print("Error: InpBaseLots must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpUseVolumeFilter && InpVolLookback < 1)
+      { Print("Error: InpVolLookback must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
    if(InpUseMartingale && (InpMartMult < 1.0 || InpMartMaxSteps < 1))
       { Print("Error: martingale needs InpMartMult >= 1.0 and InpMartMaxSteps >= 1"); return INIT_PARAMETERS_INCORRECT; }
    if(InpAdrPeriod < 1)
@@ -814,6 +905,7 @@ void OnTimer()
    // Refresh ADR (used by martingale spacing + panel) and manage open trades
    g_adr_pips = CalcADR();
    ManageTrailing();
+   CheckHiddenSL();   // enforce virtual SL between ticks when InpHiddenSL is on
 
    UpdateComment();
 }
