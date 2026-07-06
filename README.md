@@ -33,7 +33,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | Field | Value |
 |---|---|
 | **Product Name** | OneMinuteMan |
-| **Version** | 9.10 |
+| **Version** | 10.00 |
 | **Platform** | MetaTrader 4 (MQL4) |
 | **Timeframe** | M1 (forced) |
 | **Strategy Type** | Scalping + Martingale Recovery |
@@ -98,8 +98,8 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         OneMinuteMan v9.10                              │
-│                     M1 Forced Scalping Architecture                     │
+│                         OneMinuteMan v10.00                              │
+│                     M1 Forced Scalping — Single-File Component Architecture (Facade + SRP classes)                     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  EVENT LAYER                    │  STATE LAYER                          │
 │  ───────────                    │  ──────────                           │
@@ -411,7 +411,7 @@ After a losing trade the EA enters a cooldown period (`InpMartCooldownBars`), th
 | `MART_SAME_DIRECTION` | 0 | Classic martingale — re-enter the **same** direction as the losing trade (average down). |
 | `MART_REVERSE_DIRECTION` | 1 | **Reverse** martingale — re-enter the **opposite** direction. Because the tracked direction flips each step, consecutive re-entries alternate. |
 
-Both modes stop after `InpMartMaxSteps` and then halt trading until the next session open.
+Both modes stop after `InpMartMaxSteps` **re-entries** (the initial trade is step 0) and then halt trading until the next session open. The halt itself is persisted to disk, so restarting the terminal does not lift it.
 
 ### Martingale Cooldown
 `InpMartCooldownBars` (default 2) enforces a minimum number of M1 bars between martingale steps, reducing the risk of rapid-fire entries during choppy conditions.
@@ -444,13 +444,16 @@ When `InpHideSL = true` and `InpUseSafetySL = true`, a wide broker-side stop los
 
 ## Equity Protection
 
-Two guards protect the account from excessive losses:
+Two guards protect the account from excessive losses. Since v10 they are evaluated on **every tick — including while a position is open** — not only before new entries.
 
 ### 1. Maximum Daily Drawdown (`InpMaxDrawdownPct`)
-If the account equity drops by more than the configured percentage from the session-start balance, all trading halts until the next session open. The baseline resets automatically at each new session.
+If the account equity drops by more than the configured percentage from the local-day starting balance, all trading halts until the next session open. The baseline is anchored to the **local calendar day** (day-stamped) and is **persisted to disk**, so neither a chart re-attach nor a full terminal restart can re-anchor it mid-day.
 
 ### 2. Minimum Equity Floor (`InpMinEquity`)
 If account equity falls below this absolute value, trading halts immediately until the next session.
+
+### Breach Behavior (`InpCloseOnGuardBreach`)
+When a guard breaches while positions are open and `InpCloseOnGuardBreach = true` (default), the EA immediately flattens all its positions, resets the martingale cycle, and halts for the day. Set it to `false` to only block new entries (v9 behavior).
 
 ---
 
@@ -467,14 +470,21 @@ Max allowed spread and slippage are computed from a **rolling EMA of the live sp
 
 ## State Persistence
 
-Martingale state (step count, direction, lot size, virtual SL entries) is automatically saved to a binary file (`OMM_State_<Symbol>_<Magic>.bin`) on every trade and on deinitialization. On `OnInit()`, the state is loaded back, allowing the EA to resume correctly after:
+The full protection state is automatically saved to a versioned binary file (`OMM_State_<Symbol>_<Magic>.bin`) on every trade, on every halt, and on deinitialization:
+
+- Martingale cycle: step count, direction, lot size, **pending re-entry flag and loss timestamp**
+- **Daily halt flag and halt-until time** — a restart can no longer bypass the daily drawdown halt
+- **Drawdown baseline and its local-day stamp** — restarting mid-day keeps the same baseline; a new day gets a fresh one
+- Virtual SL entries
+
+On `OnInit()`, the state is loaded back, allowing the EA to resume correctly after:
 
 - MT4 terminal restart
 - Chart re-attachment
 - VPS migration
 - EA recompilation
 
-Closed positions are filtered out during load, so only active virtual SL entries are recovered.
+The file starts with a format tag; state files from v9 or older fail the tag check and are discarded safely (fresh start). Closed positions are filtered out during load and the entry count is clamped, so only active virtual SL entries are recovered.
 
 ---
 
@@ -555,7 +565,7 @@ Closed positions are filtered out during load, so only active virtual SL entries
 | `InpUseMartingale` | true | Enable martingale re-entry |
 | `InpMartMode` | SAME_DIRECTION | Re-entry direction mode |
 | `InpMartMult` | 2.0 | Lot multiplier per step |
-| `InpMartMaxSteps` | 5 | Maximum martingale steps |
+| `InpMartMaxSteps` | 5 | Maximum martingale re-entries after the initial trade |
 | `InpMartCooldownBars` | 2 | Minimum bars between steps |
 
 ### Equity Protection
@@ -563,6 +573,7 @@ Closed positions are filtered out during load, so only active virtual SL entries
 |---|---|---|
 | `InpMaxDrawdownPct` | 10.0 | Halt trading if daily DD >= this % |
 | `InpMinEquity` | 100.0 | Halt trading if equity < this |
+| `InpCloseOnGuardBreach` | true | Force-close open positions when a guard breaches |
 
 ### Trading Session
 | Input | Default | Description |
@@ -585,6 +596,16 @@ Closed positions are filtered out during load, so only active virtual SL entries
 ---
 
 ## Changelog
+
+### v10.00
+- **Single-file component architecture**: full rewrite into 13 single-responsibility classes behind a `CExpertAdvisor` facade (`CSpreadMonitor`, `CRangeScanner`, `CCandleEngine`, `CPpmEngine`, `CVolumeFilter`, `CSessionClock`, `CEquityGuard`, `CRiskModel`, `CVirtualStopManager`, `CTrailingManager`, `CMartingaleController`, `CTradeExecutor`, `CStateStore`). No global mutable state; MT4 event handlers only delegate.
+- **FIX: ZigZag init check** — `OnInit` now scans the whole lookback window for a pivot instead of probing bar 1 (which legitimately returns 0 on non-pivot bars and caused false init failures).
+- **FIX: virtual SL retry** — a failed `OrderClose` no longer drops the virtual SL entry; it stays active and retries on the next timer tick instead of silently downgrading protection to the wide safety SL.
+- **FIX: persistent halt & drawdown baseline** — halt flag, halt-until time, day baseline, day stamp, pending martingale re-entry and loss time are now saved/restored. Restarting the terminal can no longer bypass the daily drawdown halt or re-anchor the baseline.
+- **FIX: state file hardening** — versioned format tag (old files discarded safely), VSL count clamped to capacity, stale tickets dropped instead of counted.
+- **FIX: martingale step semantics** — the initial trade is step 0, so `InpMartMaxSteps` now truly equals the number of re-entries (previously off by one).
+- **NEW: `InpCloseOnGuardBreach`** — equity guards are evaluated on every tick, even with open positions, and can flatten immediately on breach (default true).
+- **Cleanup**: removed dead history-scan cache; day baseline also rolls on local-day change during multi-day runs; no state save after a failed init.
 
 ### v9.10
 - **Equity protection guards**: Added `InpMaxDrawdownPct` and `InpMinEquity` with daily session reset.
