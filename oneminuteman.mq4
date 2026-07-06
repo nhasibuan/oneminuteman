@@ -5,9 +5,9 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/oneminuteman"
-#property version   "8.00"
+#property version   "9.00"
 #property strict
-#property description "OneMinuteMan: forced-M1 range + candle + PPM engine with virtual hidden SL, volume filter, trailing stop, TP, and ADR-spaced martingale (SAME or REVERSE direction)"
+#property description "OneMinuteMan: forced-M1 range + candle + PPM engine. Immediate volume-gated martingale re-entry (SAME/REVERSE), ATR-dynamic virtual SL/TP/trailing, and adaptive slippage/spread from rolling averages (symbol-agnostic)"
 
 //==================================================================
 // SECTION 0 — ENUMERATIONS (declared first so inputs can use them)
@@ -64,7 +64,7 @@ input int    InpZzBackstep  = 1;     // ZigZag Backstep
 input int    InpZzLookback  = 100;   // Bars to scan for ZigZag pivots
 input double InpPpmMinHigh  = 2.0;   // PPM threshold — below this is low efficiency
 input double InpPpmTarget   = 4.0;   // PPM target — ideal entry zone
-input double InpAtrDailyRef = 1.5;   // ATR M1 daily baseline in pips (default 1.5)
+input double InpAtrDailyRef = 1.5;   // PPM volatility baseline in pips (display only)
 input bool   InpShowPPM     = true;  // Show PPM panel in Comment()
 //--- Volume Filter
 input bool   InpUseVolumeFilter = true;  // Enable volume spike filter
@@ -73,21 +73,30 @@ input double InpVolMultiplier   = 1.5;   // Volume must be >= this x average to 
 //--- Trade Management (order execution)
 input bool   InpEnableTrading = false;  // Master switch: allow live order execution
 input double InpBaseLots      = 0.01;   // Base lot size for the first entry
-input int    InpSlippage      = 0;      // Max slippage (points); 0 = auto per symbol
-input int    InpMaxSpread     = 0;      // Max spread to allow entry (points); 0 = auto per symbol
+input int    InpSlippage      = 0;      // Max slippage (points); 0 = AUTO (from avg spread)
+input int    InpMaxSpread     = 0;      // Max spread (points); 0 = AUTO (from avg spread)
 input int    InpMagic         = 202506; // Magic number (position tag)
-input double InpTP_Pips       = 0;      // Take profit (pips); 0 = auto per symbol
-input double InpSL_Pips       = 0;      // Stop loss (pips); 0 = auto per symbol
+input double InpTP_Pips       = 0;      // Take profit (pips); 0 = AUTO (ATR-based)
+input double InpSL_Pips       = 0;      // Stop loss (pips); 0 = AUTO (ATR-based)
 input bool   InpHideSL        = true;   // Hide SL from broker terminal (virtual SL)
-input double InpTrailStart    = 0;      // Trailing activation (pips); 0 = auto
-input double InpTrailStep     = 0;      // Trailing distance (pips); 0 = auto
-//--- Martingale Re-entry (ADR-spaced)
-input bool          InpUseMartingale = true;                 // Re-open after a loss (martingale)
-input ENUM_MART_MODE InpMartMode     = MART_SAME_DIRECTION;  // Re-entry direction mode (SAME / REVERSE)
-input double        InpMartMult      = 2.0;                  // Lot multiplier per martingale step
-input int           InpMartMaxSteps  = 5;                    // Max martingale steps per cycle
-input int           InpAdrPeriod     = 14;                   // ADR averaging period (days)
-input double        InpAdrFraction   = 0.10;                 // Re-entry spacing = fraction of ADR
+input double InpTrailStart    = 0;      // Trailing activation (pips); 0 = AUTO (ATR-based)
+input double InpTrailStep     = 0;      // Trailing distance (pips); 0 = AUTO (ATR-based)
+//--- Dynamic Risk (ATR-based; used when the matching manual input above is 0)
+input int    InpAtrPeriod         = 14;   // ATR period (M1) for dynamic SL/TP/trailing
+input double InpAtrSLMult         = 1.5;  // SL   pips = ATR(pips) x this
+input double InpAtrTPMult         = 2.0;  // TP   pips = ATR(pips) x this
+input double InpAtrTrailStartMult = 1.0;  // Trailing activation pips = ATR(pips) x this
+input double InpAtrTrailStepMult  = 0.5;  // Trailing distance   pips = ATR(pips) x this
+input double InpMinRiskPips        = 1.0; // Safety floor for ATR-derived pips
+//--- Dynamic Execution (adaptive slippage / max-spread; symbol-agnostic)
+input double InpMaxSpreadMult = 2.5;   // AUTO max spread = avg spread(points) x this
+input double InpSlippageMult  = 1.5;   // AUTO slippage   = avg spread(points) x this
+input double InpSprEmaAlpha   = 0.05;  // EMA smoothing for rolling avg spread (0..1]
+//--- Martingale Re-entry (immediate, volume-gated)
+input bool           InpUseMartingale = true;                // Re-open after a loss (martingale)
+input ENUM_MART_MODE InpMartMode      = MART_SAME_DIRECTION; // Re-entry direction (SAME / REVERSE)
+input double         InpMartMult      = 2.0;                 // Lot multiplier per martingale step
+input int            InpMartMaxSteps  = 5;                   // Max martingale steps per cycle
 //--- Trading Session (local time = UTC + InpTzOffsetHours)
 input int    InpTzOffsetHours    = 7;   // Local timezone offset from UTC (UTC+7)
 input int    InpSessionStartHour = 5;   // Local hour to (re)start trading (Sydney~5 / Tokyo~7)
@@ -165,7 +174,7 @@ static double   g_last_entry    = 0.0;
 static double   g_last_lots     = 0.0;
 static int      g_mart_step     = 0;
 static bool     g_await_reentry = false;
-static double   g_adr_pips      = 0.0;
+static double   g_spread_ema     = 0.0;  // rolling avg spread (points) for adaptive exec
 static datetime g_halt_until     = 0;
 static bool     g_trading_halted = false;
 //--- Virtual SL tracker
@@ -417,7 +426,7 @@ string TrendName(TYPE_TREND u)
 }
 
 //==================================================================
-// SECTION 12 — TRADE MODULE: pip / symbol helpers
+// SECTION 12 — TRADE MODULE: pips, ATR risk & adaptive execution
 //==================================================================
 double PipSize()
 {
@@ -429,48 +438,53 @@ double PipToPrice(double pips)
    return pips * PipSize();
 }
 
-void GetSymbolProfile(double &tp, double &sl, double &trailStart, double &trailStep)
+// Current M1 ATR expressed in pips (0 if not yet available).
+double AtrPips()
 {
-   string s = Symbol();
-   if(StringFind(s, "XAU") >= 0)                                   // Gold (pip = 0.01)
-   { tp = 150; sl = 250; trailStart = 100; trailStep = 50; }
-   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0) // EUR/USD
-   { tp = 6;   sl = 8;   trailStart = 5;   trailStep = 3;  }
-   else                                                            // generic FX
-   { tp = 10;  sl = 15;  trailStart = 8;   trailStep = 5;  }
+   double atr = iATR(Symbol(), PERIOD_M1, InpAtrPeriod, 1);
+   double p   = atr / PipSize();
+   return (p > 0.0) ? p : 0.0;
 }
 
+// Dynamic SL / TP / trailing derived from recent ATR.
+// Any input left at 0 is auto-filled from ATR; a floor keeps values sane.
 void ResolveTradeParams(double &tp, double &sl, double &trailStart, double &trailStep)
 {
-   double atp, asl, ats, atstep;
-   GetSymbolProfile(atp, asl, ats, atstep);
-   tp         = (InpTP_Pips    > 0.0) ? InpTP_Pips    : atp;
-   sl         = (InpSL_Pips    > 0.0) ? InpSL_Pips    : asl;
-   trailStart = (InpTrailStart > 0.0) ? InpTrailStart : ats;
-   trailStep  = (InpTrailStep  > 0.0) ? InpTrailStep  : atstep;
+   double atrPips = AtrPips();
+   double floorP  = (InpMinRiskPips > 0.0) ? InpMinRiskPips : 1.0;
+
+   double dynSL   = MathMax(atrPips * InpAtrSLMult,         floorP);
+   double dynTP   = MathMax(atrPips * InpAtrTPMult,         floorP);
+   double dynTS   = MathMax(atrPips * InpAtrTrailStartMult, floorP);
+   double dynTStp = MathMax(atrPips * InpAtrTrailStepMult,  floorP * 0.5);
+
+   sl         = (InpSL_Pips    > 0.0) ? InpSL_Pips    : dynSL;
+   tp         = (InpTP_Pips    > 0.0) ? InpTP_Pips    : dynTP;
+   trailStart = (InpTrailStart > 0.0) ? InpTrailStart : dynTS;
+   trailStep  = (InpTrailStep  > 0.0) ? InpTrailStep  : dynTStp;
 }
 
-void GetSymbolExec(int &slippage, int &maxSpread)
+// Rolling average spread in points (EMA), symbol-agnostic.
+double AvgSpreadPoints()
 {
-   string s = Symbol();
-   if(StringFind(s, "XAU") >= 0)
-   { slippage = 30; maxSpread = 50; }
-   else if(StringFind(s, "EUR") >= 0 && StringFind(s, "USD") >= 0)
-   { slippage = 5;  maxSpread = 15; }
-   else
-   { slippage = 10; maxSpread = 25; }
+   if(g_spread_ema > 0.0) return g_spread_ema;
+   return (Ask - Bid) / Point;
 }
 
+// Adaptive slippage (points): manual override if > 0, else from avg spread.
 int EffSlippage()
 {
-   int sl, ms; GetSymbolExec(sl, ms);
-   return (InpSlippage > 0) ? InpSlippage : sl;
+   if(InpSlippage > 0) return InpSlippage;
+   int v = (int)MathCeil(AvgSpreadPoints() * InpSlippageMult);
+   return (v < 1) ? 1 : v;
 }
 
+// Adaptive max allowed spread (points): manual override if > 0, else from avg spread.
 int EffMaxSpread()
 {
-   int sl, ms; GetSymbolExec(sl, ms);
-   return (InpMaxSpread > 0) ? InpMaxSpread : ms;
+   if(InpMaxSpread > 0) return InpMaxSpread;
+   int v = (int)MathCeil(AvgSpreadPoints() * InpMaxSpreadMult);
+   return (v < 1) ? 1 : v;
 }
 
 bool SpreadOK()
@@ -481,7 +495,7 @@ bool SpreadOK()
 }
 
 //==================================================================
-// SECTION 13 — TRADE MODULE: session / ADR
+// SECTION 13 — TRADE MODULE: session
 //==================================================================
 datetime LocalNow()
 {
@@ -512,20 +526,6 @@ bool TradingWindowOpen()
       else                          return false;
    }
    return InSession();
-}
-
-double CalcADR()
-{
-   double sum = 0.0;
-   int cnt = 0;
-   for(int i = 1; i <= InpAdrPeriod; i++)
-   {
-      double hi = iHigh(Symbol(), PERIOD_D1, i);
-      double lo = iLow(Symbol(),  PERIOD_D1, i);
-      if(hi > 0.0 && lo > 0.0) { sum += (hi - lo); cnt++; }
-   }
-   if(cnt == 0) return 0.0;
-   return (sum / cnt) / PipSize();
 }
 
 double NormalizeLots(double lots)
@@ -781,7 +781,7 @@ int ResolveMartingaleDir()
    return (InpMartMode == MART_REVERSE_DIRECTION) ? -g_last_dir : g_last_dir;
 }
 
-// Fresh entries + ADR-spaced martingale re-entry
+// Fresh entries + IMMEDIATE volume-gated martingale re-entry (no ADR spacing)
 void ManageEntries(bool allowFresh)
 {
    if(!InpEnableTrading)     return;
@@ -789,26 +789,21 @@ void ManageEntries(bool allowFresh)
    if(!TradingWindowOpen())  return;
    if(!SpreadOK())           return;
 
-   // Martingale re-entry, triggered after price has moved adversely by
-   // >= InpAdrFraction x ADR pips relative to the previous losing entry.
+   // Martingale re-entry: fire IMMEDIATELY once the volume filter passes.
+   // No ADR / adverse-move spacing is required. Direction per InpMartMode.
    if(g_await_reentry && InpUseMartingale && g_mart_step < InpMartMaxSteps)
    {
-      double adr     = (g_adr_pips > 0.0) ? g_adr_pips : CalcADR();
-      double reentry = InpAdrFraction * adr;
-      double adverse = (g_last_dir > 0) ? (g_last_entry - Bid) / PipSize()
-                                        : (Ask - g_last_entry) / PipSize();
-      if(reentry > 0.0 && adverse >= reentry)
+      if(!VolumeOK()) return;   // wait only until a volume spike passes
+
+      int    reDir = ResolveMartingaleDir();   // SAME or REVERSE per InpMartMode
+      double lots  = NormalizeLots(g_last_lots * InpMartMult);
+      if(OpenTrade(reDir, lots))
       {
-         int    reDir = ResolveMartingaleDir();   // SAME or REVERSE per InpMartMode
-         double lots  = NormalizeLots(g_last_lots * InpMartMult);
-         if(OpenTrade(reDir, lots))
-         {
-            g_mart_step++;
-            g_last_dir      = reDir;   // track new direction (enables alternating in REVERSE mode)
-            g_last_lots     = lots;
-            g_last_entry    = (reDir > 0) ? Ask : Bid;
-            g_await_reentry = false;
-         }
+         g_mart_step++;
+         g_last_dir      = reDir;   // track new direction (enables alternating in REVERSE mode)
+         g_last_lots     = lots;
+         g_last_entry    = (reDir > 0) ? Ask : Bid;
+         g_await_reentry = false;
       }
       return;
    }
@@ -839,7 +834,7 @@ void ManageEntries(bool allowFresh)
 void UpdateComment()
 {
    string tf  = TFLabel();
-   string msg = "=== OneMinuteMan v8.00 ===\n";
+   string msg = "=== OneMinuteMan v9.00 ===\n";
    msg += StringFormat("Symbol:%-6s  Engines:M1 (forced)  Chart:%s\n", Symbol(), tf);
 
    // --- Range panel
@@ -906,19 +901,21 @@ void UpdateComment()
       ResolveTradeParams(tp, sl, ts, tstep);
       msg += StringFormat("Trading: %s  Magic:%d  HideSL:%s\n",
                           InpEnableTrading ? "ON" : "OFF", InpMagic, InpHideSL ? "ON" : "OFF");
-      msg += StringFormat("TP:%.0f SL:%.0f Trail:%.0f/%.0f pips\n", tp, sl, ts, tstep);
+      msg += StringFormat("Dyn TP:%.1f SL:%.1f Trail:%.1f/%.1f pips (ATR-based)\n", tp, sl, ts, tstep);
    }
+   msg += StringFormat("ATR(M1,%d): %.1f pips  AvgSpread: %.1f pts\n",
+                       InpAtrPeriod, AtrPips(), AvgSpreadPoints());
    msg += StringFormat("Open:%d  Mart:%d/%d (%s) %s\n",
                        CountPositions(), g_mart_step, InpMartMaxSteps,
                        MartModeName(InpMartMode),
-                       g_await_reentry ? "[AWAIT RE-ENTRY]" : "");
-   msg += StringFormat("ADR:%.0f pips  Re-entry@%.0f pips\n",
-                       g_adr_pips, InpAdrFraction * g_adr_pips);
+                       g_await_reentry ? "[AWAIT VOL PASS]" : "");
+   msg += "Re-entry: IMMEDIATE on Vol PASS (no ADR spacing)\n";
    if(InpHideSL && g_vsl_count > 0)
       msg += StringFormat("VSL tracking: %d position(s)\n", g_vsl_count);
-   msg += StringFormat("Session: %s (UTC+%d %dh-%dh)  Spread<=%d\n",
+   msg += StringFormat("Session: %s (UTC+%d %dh-%dh)  MaxSpread<=%d slip=%d\n",
                        (TradingWindowOpen() ? "OPEN" : (g_trading_halted ? "HALTED" : "CLOSED")),
-                       InpTzOffsetHours, InpSessionStartHour, InpSessionEndHour, EffMaxSpread());
+                       InpTzOffsetHours, InpSessionStartHour, InpSessionEndHour,
+                       EffMaxSpread(), EffSlippage());
    if(g_trading_halted)
       msg += StringFormat("Resume : %s (local)\n", TimeToString(g_halt_until));
 
@@ -944,10 +941,18 @@ int OnInit()
    { Print("Error: InpBaseLots must be > 0"); return INIT_PARAMETERS_INCORRECT; }
    if(InpUseMartingale && (InpMartMult < 1.0 || InpMartMaxSteps < 1))
    { Print("Error: martingale needs InpMartMult >= 1.0 and InpMartMaxSteps >= 1"); return INIT_PARAMETERS_INCORRECT; }
-   if(InpAdrPeriod < 1)
-   { Print("Error: InpAdrPeriod must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
-   if(InpAdrFraction <= 0.0)
-   { Print("Error: InpAdrFraction must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpAtrPeriod < 1)
+   { Print("Error: InpAtrPeriod must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpAtrSLMult <= 0.0 || InpAtrTPMult <= 0.0)
+   { Print("Error: InpAtrSLMult and InpAtrTPMult must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpAtrTrailStartMult < 0.0 || InpAtrTrailStepMult < 0.0)
+   { Print("Error: ATR trailing multipliers must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpMinRiskPips < 0.0)
+   { Print("Error: InpMinRiskPips must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpMaxSpreadMult <= 0.0 || InpSlippageMult <= 0.0)
+   { Print("Error: InpMaxSpreadMult and InpSlippageMult must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpSprEmaAlpha <= 0.0 || InpSprEmaAlpha > 1.0)
+   { Print("Error: InpSprEmaAlpha must be in (0, 1]"); return INIT_PARAMETERS_INCORRECT; }
    if(InpSessionStartHour < 0 || InpSessionStartHour > 23)
    { Print("Error: InpSessionStartHour must be 0-23"); return INIT_PARAMETERS_INCORRECT; }
    if(InpSessionEndHour < 1 || InpSessionEndHour > 24)
@@ -959,24 +964,23 @@ int OnInit()
 
    ArrayResize(g_prices, BUFFER_SIZE);
    ArrayInitialize(g_prices, 0.0);
-   g_vsl_count = 0;
-
-   // Pre-load ADR so martingale spacing is available from the first tick
-   g_adr_pips = CalcADR();
+   g_vsl_count  = 0;
+   g_spread_ema = 0.0;
 
    if(!EventSetMillisecondTimer(InpSampleMs))
    { Print("Error: EventSetMillisecondTimer failed"); return INIT_FAILED; }
 
-   Print("OneMinuteMan v8.00 initialized: ", Symbol(), " (engines forced to M1)",
+   Print("OneMinuteMan v9.00 initialized: ", Symbol(), " (engines forced to M1)",
          " | ZZ:", InpZzDepth, "-", InpZzDeviation, "-", InpZzBackstep,
          " | PPM min:", InpPpmMinHigh, " target:", InpPpmTarget,
          " | HideSL:", (InpHideSL ? "ON" : "OFF"),
          " | VolFilter:", (InpUseVolumeFilter ? "ON" : "OFF"),
          " | Trading:", (InpEnableTrading ? "ON" : "OFF"),
          " Martingale:", (InpUseMartingale ? "ON" : "OFF"),
-         " Mode:", MartModeName(InpMartMode),
-         " | Session UTC+", InpTzOffsetHours, " ", InpSessionStartHour, "h-", InpSessionEndHour, "h",
-         " | ADR=", g_adr_pips, " pips");
+         " Mode:", MartModeName(InpMartMode), " (immediate/vol-gated)",
+         " | Risk:ATR(", InpAtrPeriod, ") SLx", InpAtrSLMult, " TPx", InpAtrTPMult,
+         " | Exec:adaptive spread/slippage",
+         " | Session UTC+", InpTzOffsetHours, " ", InpSessionStartHour, "h-", InpSessionEndHour, "h");
    return INIT_SUCCEEDED;
 }
 
@@ -984,12 +988,20 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    Comment("");
-   Print("OneMinuteMan v8.00 stopped. Reason: ", reason);
+   Print("OneMinuteMan v9.00 stopped. Reason: ", reason);
 }
 
 void OnTimer()
 {
    RefreshRates();
+
+   // Rolling average spread (points) for adaptive slippage / max-spread (any symbol).
+   double curSpr = (Ask - Bid) / Point;
+   if(curSpr > 0.0)
+   {
+      if(g_spread_ema <= 0.0) g_spread_ema = curSpr;
+      else                    g_spread_ema += InpSprEmaAlpha * (curSpr - g_spread_ema);
+   }
 
    g_prices[g_head] = Ask;
    g_count = MathMin(g_count + 1, InpWindowSize);
@@ -1000,7 +1012,6 @@ void OnTimer()
    PPM_RESULT ppmTmp;
    if(CalcPPM(ppmTmp)) { g_ppm = ppmTmp; g_ppm_valid = true; }
 
-   // ADR is recomputed once per new M1 bar (see OnTick), not every 50ms timer tick.
    ManageTrailing();
    VslCheck();     // enforce virtual SL on every timer tick for fast response
 
@@ -1013,9 +1024,6 @@ void OnTick()
 
    if(newBar)
    {
-      // Clean-code/perf: refresh ADR once per bar instead of every 50ms timer tick.
-      g_adr_pips = CalcADR();
-
       CANDLE_STRUCTURE bar;
       if(RecognizeCandle(Symbol(), PERIOD_M1, iTime(Symbol(), PERIOD_M1, 1), InpAverPeriod, bar))
       {
