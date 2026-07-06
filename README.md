@@ -10,8 +10,9 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 
 - [Product Requirements Document](#product-requirements-document)
 - [Architecture Blueprint](#architecture-blueprint)
+- [Data Dictionary](#data-dictionary)
 - [Data Flow Diagram](#data-flow-diagram)
-- [UML Sequence Diagram](#uml-sequence-diagram)
+- [UML Sequence Diagrams](#uml-sequence-diagrams)
 - [How It Works](#how-it-works)
 - [Signal Logic](#signal-logic)
 - [Martingale Modes](#martingale-modes)
@@ -37,6 +38,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | **Platform** | MetaTrader 4 (MQL4) |
 | **Timeframe** | M1 (forced) |
 | **Strategy Type** | Scalping + Martingale Recovery |
+| **Architecture** | Single-file component design (Facade + 13 SRP classes) |
 | **Risk Level** | High |
 
 ### PRD-002 — Functional Requirements
@@ -61,6 +63,10 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | FR-016 | Persistent state save/load across EA restarts | P0 | Implemented |
 | FR-017 | Real-time on-chart info panel | P1 | Implemented |
 | FR-018 | Input validation with error codes on init | P1 | Implemented |
+| FR-019 | Persist daily halt, halt-until time, and drawdown baseline across restarts | P0 | Implemented (v10) |
+| FR-020 | Evaluate equity guards on every tick, including with open positions | P0 | Implemented (v10) |
+| FR-021 | Optionally flatten all positions on guard breach (`InpCloseOnGuardBreach`) | P0 | Implemented (v10) |
+| FR-022 | Retry virtual-SL close on broker rejection instead of dropping protection | P0 | Implemented (v10) |
 
 ### PRD-003 — Non-Functional Requirements
 
@@ -72,6 +78,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | NFR-004 | Symbol agnostic (no hardcoded pairs) | 100% |
 | NFR-005 | Graceful degradation on missing ZigZag | Fail on init |
 | NFR-006 | State recovery time | < 100ms |
+| NFR-007 | State file format | Versioned (tagged); old formats discarded safely |
 
 ### PRD-004 — Signal Entry Conditions (ALL must be true)
 1. Trading enabled (`InpEnableTrading = true`)
@@ -85,7 +92,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 
 ### PRD-005 — Martingale Re-Entry Conditions (ALL must be true)
 1. Previous trade was a loss
-2. Martingale step < max steps
+2. Martingale step < max steps (initial trade = step 0, so max steps = number of re-entries)
 3. Martingale cooldown bars elapsed
 4. Volume filter passes
 5. Equity guard passes
@@ -96,80 +103,156 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 
 ## Architecture Blueprint
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         OneMinuteMan v10.00                              │
-│                     M1 Forced Scalping — Single-File Component Architecture (Facade + SRP classes)                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│  EVENT LAYER                    │  STATE LAYER                          │
-│  ───────────                    │  ──────────                           │
-│  OnInit()    → Validate inputs  │  g_prices[]      — Tick buffer        │
-│              → Load state       │  g_candle        — Last bar struct    │
-│              → Start timer      │  g_ppm           — PPM result         │
-│              → Verify ZigZag    │  g_vsl[]         — Virtual SL entries │
-│  OnDeinit()  → Save state       │  g_spread_ema    — Rolling spread     │
-│              → Kill timer       │  g_mart_step     — Martingale counter │
-│  OnTimer()   → Sample ticks     │  g_await_reentry — Re-entry flag      │
-│              → Update range     │  g_trading_halted— Daily halt flag    │
-│              → Compute PPM      │  g_day_start_balance— DD baseline     │
-│              → Trail / VSL      │                                       │
-│  OnTick()    → Detect new bar   │                                       │
-│              → Recognize candle │                                       │
-│              → Update state     │                                       │
-│              → Manage entries   │                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ENGINE LAYER                                                           │
-│  ────────────                                                           │
-│                                                                           │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐               │
-│   │ Range Scanner│    │Candle Engine │    │  PPM Engine  │               │
-│   │──────────────│    │──────────────│    │──────────────│               │
-│   │ Circular buf │    │ Pattern recog│    │ ZigZag scan  │               │
-│   │ Rolling H/L  │    │ Trend (SMA)  │    │ Pips/minute  │               │
-│   └──────┬───────┘    └──────┬───────┘    └──────┬───────┘               │
-│          │                   │                   │                        │
-│          └───────────────────┼───────────────────┘                        │
-│                              ▼                                            │
-│   ┌──────────────────────────────────────────────────────┐               │
-│   │              SIGNAL GATE (ALL must pass)              │               │
-│   │  PPM zone >= MEDIUM + Volume OK + Candle signal +    │               │
-│   │  Session open + Spread OK + Equity guard OK          │               │
-│   └──────────────────────────┬───────────────────────────┘               │
-│                              ▼                                            │
-│   ┌──────────────────────────────────────────────────────┐               │
-│   │              EXECUTION MODULE                         │               │
-│   │  ATR-dynamic SL/TP · Virtual SL · Safety SL · BE     │               │
-│   │  Trailing stop · Adaptive slippage/spread            │               │
-│   └──────────────────────────┬───────────────────────────┘               │
-│                              ▼                                            │
-│   ┌──────────────────────────────────────────────────────┐               │
-│   │              MARTINGALE CONTROLLER                    │               │
-│   │  SAME / REVERSE mode · Cooldown bars · Step limit    │               │
-│   │  State persistence · Daily halt after max steps      │               │
-│   └──────────────────────────┬───────────────────────────┘               │
-│                              ▼                                            │
-│   ┌──────────────────────────────────────────────────────┐               │
-│   │              EQUITY PROTECTION LAYER                  │               │
-│   │  Max drawdown % · Min equity floor · Daily reset     │               │
-│   └──────────────────────────────────────────────────────┘               │
-│                                                                           │
-└─────────────────────────────────────────────────────────────────────────┘
+Single `.mq4` file, component-based. The MT4 event handlers delegate to a **`CExpertAdvisor` facade**, which wires 13 single-responsibility components.
+
+```mermaid
+graph TB
+    subgraph EVT["MT4 Event Layer"]
+        ONINIT["OnInit"]
+        ONTICK["OnTick"]
+        ONTIMER["OnTimer every 50 ms"]
+        ONDEINIT["OnDeinit"]
+    end
+
+    FACADE["CExpertAdvisor - Facade"]
+
+    subgraph SIG["Signal Engines"]
+        RANGE["CRangeScanner - rolling tick High/Low"]
+        CANDLE["CCandleEngine - pattern + trend + signal"]
+        PPM["CPpmEngine - ZigZag pips-per-minute"]
+        VOL["CVolumeFilter - tick-volume spike gate"]
+    end
+
+    subgraph EXE["Execution and Risk"]
+        SPREAD["CSpreadMonitor - adaptive spread and slippage"]
+        RISK["CRiskModel - ATR-dynamic SL/TP/trailing"]
+        EXEC["CTradeExecutor - order send / flatten / history"]
+        VSL["CVirtualStopManager - hidden SL registry"]
+        TRAIL["CTrailingManager - break-even + trailing"]
+    end
+
+    subgraph PROT["Protection and State"]
+        CLOCK["CSessionClock - timezone / session / day stamp"]
+        GUARD["CEquityGuard - drawdown and equity floor"]
+        MART["CMartingaleController - recovery state machine"]
+        STORE["CStateStore - versioned binary persistence"]
+    end
+
+    ONINIT --> FACADE
+    ONTICK --> FACADE
+    ONTIMER --> FACADE
+    ONDEINIT --> FACADE
+
+    FACADE --> RANGE
+    FACADE --> CANDLE
+    FACADE --> PPM
+    FACADE --> VOL
+    FACADE --> SPREAD
+    FACADE --> RISK
+    FACADE --> EXEC
+    FACADE --> VSL
+    FACADE --> TRAIL
+    FACADE --> CLOCK
+    FACADE --> GUARD
+    FACADE --> MART
+    FACADE --> STORE
+
+    EXEC --> RISK
+    EXEC --> VSL
+    TRAIL --> RISK
+    TRAIL --> VSL
+    STORE --> MART
+    STORE --> VSL
 ```
 
 ### Component Responsibilities
 
-| Component | Responsibility | Key Functions |
+| Component | Responsibility | Key Methods |
 |---|---|---|
-| **Range Scanner** | Maintain rolling tick window and compute H/L | `ScanHighLow()` |
-| **Candle Engine** | Classify candlestick patterns and trend | `RecognizeCandle()`, `SignalDirection()` |
-| **PPM Engine** | Measure market efficiency via ZigZag pivots | `CalcPPM()` |
-| **Volume Filter** | Gate entries on tick-volume spikes | `VolumeOK()` |
-| **Execution Module** | Order sending with dynamic risk params | `OpenTrade()`, `ResolveTradeParams()` |
-| **Virtual SL Manager** | Hidden SL tracking + broker safety net | `VslRegister()`, `VslCheck()` |
-| **Trailing Manager** | ATR-dynamic trailing + break-even | `ManageTrailing()` |
-| **Martingale Controller** | Loss recovery with cooldown and limits | `ManageEntries()`, `ResolveMartingaleDir()` |
-| **Equity Guard** | Daily drawdown and minimum equity protection | `EquityGuardOK()`, `HaltForToday()` |
-| **State Persistence** | Save/restore martingale state to disk | `SaveState()`, `LoadState()` |
+| **CSpreadMonitor** | Rolling spread EMA; adaptive max-spread & slippage | `Update()`, `SpreadOK()`, `EffSlippage()`, `EffMaxSpread()` |
+| **CRangeScanner** | Rolling tick window and High/Low range | `Sample()`, `High()`, `Low()`, `Range()` |
+| **CCandleEngine** | Classify candlestick patterns and trend; derive signal | `Recognize()`, `SignalDirection()` |
+| **CPpmEngine** | Market efficiency via ZigZag pivots; init verification | `Calc()`, `VerifyIndicator()` |
+| **CVolumeFilter** | Gate entries on tick-volume spikes | `Ok()` |
+| **CSessionClock** | Timezone, session window, local day stamp | `InSession()`, `LocalDayStamp()`, `NextSessionOpenGMT()` |
+| **CEquityGuard** | Daily drawdown & minimum-equity protection, day-stamped baseline | `Breached()`, `RollDayIfNeeded()`, `SetBaseline()` |
+| **CRiskModel** | ATR-dynamic SL/TP/trailing/break-even distances | `Resolve()`, `AtrPips()` |
+| **CVirtualStopManager** | Hidden SL registry, enforcement with retry, tighten-only updates | `Register()`, `Enforce()`, `Tighten()` |
+| **CTrailingManager** | ATR trailing + break-even lock (virtual or broker SL) | `Manage()` |
+| **CMartingaleController** | Loss-recovery state machine with cooldown and step cap | `OnPositionClosed()`, `CanReenter()`, `ReentryDir()`, `ReentryLots()` |
+| **CTradeExecutor** | Order send with dynamic params, emergency flatten, history scan | `Open()`, `CloseAll()`, `CountPositions()`, `LastClosedProfit()` |
+| **CStateStore** | Versioned binary save/load of full protection state (Memento) | `Save()`, `Load()` |
+
+---
+
+## Data Dictionary
+
+### Structures
+
+| Structure | Field | Type | Description |
+|---|---|---|---|
+| `CANDLE_STRUCTURE` | `type` | `TYPE_CANDLESTICK` | Classified pattern of the closed M1 bar |
+| | `unit` | `TYPE_TREND` | Trend of close vs. SMA(`InpAverPeriod`) |
+| | `bodysize` | `double` | Absolute body size |
+| | `shade_high` / `shade_low` | `double` | Upper / lower wick length |
+| | `avg_close` / `avg_body` | `double` | SMA of closes / average body over period |
+| | `open` `high` `low` `close` | `double` | OHLC of the classified bar |
+| `PPM_RESULT` | `ppm` | `double` | Pips per minute of the last ZigZag leg |
+| | `pips` | `double` | Pip distance of the leg |
+| | `atr_ratio` | `double` | `ppm / InpAtrDailyRef` (display only) |
+| | `candles` | `int` | M1 bars spanned by the leg |
+| | `zone` | `PPM_ZONE` | Efficiency zone classification |
+| | `pivot_start` / `pivot_end` | `datetime` | Leg boundary times |
+| `VSL_ENTRY` | `ticket` | `int` | Order ticket being protected |
+| | `dir` | `int` | +1 long / -1 short |
+| | `vsl_price` | `double` | Hidden stop-loss price |
+| | `be_price` | `double` | Break-even lock price |
+| | `safety_sl_price` | `double` | Wide broker-side safety SL |
+| | `active` | `bool` | Entry currently enforced |
+| | `fail_count` | `int` | Failed close attempts (retry counter) |
+| `TRADE_PARAMS` | `tp_pips` `sl_pips` | `double` | Resolved TP / SL distances |
+| | `trail_start` `trail_step` | `double` | Trailing activation / step distances |
+| | `be_trigger` | `double` | Break-even trigger distance |
+
+### Enumerations
+
+| Enum | Values |
+|---|---|
+| `ENUM_MART_MODE` | `MART_SAME_DIRECTION` (0), `MART_REVERSE_DIRECTION` (1) |
+| `TYPE_CANDLESTICK` | `CAND_UNKNOWN`, `CAND_LONG`, `CAND_SHORT`, `CAND_DOJI`, `CAND_MARUBOZU`, `CAND_HAMMER`, `CAND_INVERTED_HAMMER`, `CAND_SPINNING_TOP`, `CAND_DRAGONFLY_DOJI`, `CAND_GRAVESTONE_DOJI`, `CAND_LONG_LEGGED_DOJI` |
+| `TYPE_TREND` | `TREND_UNKNOWN`, `TREND_UPPER`, `TREND_DOWN`, `TREND_LATERAL` |
+| `PPM_ZONE` | `PPM_ZONE_NONE`, `PPM_ZONE_LOW`, `PPM_ZONE_MEDIUM`, `PPM_ZONE_HIGH` |
+
+### State File Format — `OMM_State_<Symbol>_<Magic>.bin`
+
+Binary, written on every trade, every halt, and deinit. Read order:
+
+| # | Field | Type | Notes |
+|---|---|---|---|
+| 1 | Format tag | `int` | `0x4F4D4D33` — old/unknown tags are discarded safely |
+| 2 | Martingale step | `int` | Initial trade = 0 |
+| 3 | Last direction | `int` | +1 / -1 |
+| 4 | Last lot size | `double` | |
+| 5 | Await-reentry flag | `int` | 0 / 1 |
+| 6 | Last loss time | `long` | Unix time |
+| 7 | Halted flag | `int` | 0 / 1 |
+| 8 | Halt-until time | `long` | GMT Unix time |
+| 9 | Drawdown baseline | `double` | Day-start balance |
+| 10 | Day stamp | `int` | Local `yyyymmdd` of the baseline |
+| 11 | VSL entry count | `int` | Clamped to capacity on load |
+| 12+ | Per VSL entry | `int, int, double, double, double` | ticket, dir, vsl, be, safety |
+
+### Key Inputs Cross-Reference
+
+Full input tables live in [Inputs](#inputs); the data-critical ones:
+
+| Input | Consumed by | Effect |
+|---|---|---|
+| `InpWindowSize` | CRangeScanner | Circular buffer capacity |
+| `InpZzDepth/Deviation/Backstep` | CPpmEngine | ZigZag pivot parameters |
+| `InpAtrSLMult` etc. | CRiskModel | Distance formulas |
+| `InpMartMaxSteps` | CMartingaleController | Number of re-entries |
+| `InpMaxDrawdownPct`, `InpMinEquity`, `InpCloseOnGuardBreach` | CEquityGuard / facade | Protection thresholds & breach behavior |
 
 ---
 
@@ -177,42 +260,45 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 
 ```mermaid
 graph TD
-    subgraph "External Inputs"
-        TICK[Tick Feed<br/>Ask/Bid/Volume]
-        MT4[MT4 Server<br/>Rates/History]
-        DISK[Disk State File]
+    subgraph EXT["External Inputs"]
+        TICK["Tick feed: Ask, Bid, tick volume"]
+        MT4["MT4 server: rates and history"]
+        DISK["State file: versioned binary"]
     end
 
-    subgraph "OnTimer Loop (50ms)"
-        T1[Sample Ask → g_prices[]]
-        T2[Update spread EMA]
-        T3[ScanHighLow → g_high/g_low]
-        T4[CalcPPM → g_ppm]
-        T5[ManageTrailing]
-        T6[VslCheck → Close if hit]
-        T7[UpdateComment]
+    subgraph TIMER["OnTimer loop - every 50 ms"]
+        T1["Sample Ask into circular tick buffer"]
+        T2["Update rolling spread EMA"]
+        T3["Rescan rolling High/Low range"]
+        T4["Recompute PPM from ZigZag pivots"]
+        T5["Roll drawdown baseline on day change"]
+        T6["Manage trailing and break-even"]
+        T7["Enforce virtual SL - close or retry"]
+        T8["Refresh on-chart panel"]
     end
 
-    subgraph "OnTick Loop (New M1 Bar)"
-        K1[RecognizeCandle → g_candle]
-        K2[UpdateTradeState]
-        K3[ManageEntries]
+    subgraph TICKLOOP["OnTick loop - new M1 bar"]
+        K1["Recognize closed candle"]
+        K2["Update trade state - detect closed position"]
+        K3["Equity guard check - even with open position"]
+        K4["Manage entries"]
     end
 
-    subgraph "Entry Decision"
-        E1{EquityGuardOK?}
-        E2{TradingWindowOpen?}
-        E3{SpreadOK?}
-        E4{VolumeOK?}
-        E5{PPM >= MEDIUM?}
-        E6{Candle Signal?}
-        E7{Cooldown met?}
+    subgraph GATES["Entry Decision Gates"]
+        E1{"Equity guard OK?"}
+        E2{"Session open and not halted?"}
+        E3{"Spread within adaptive limit?"}
+        E4{"Volume spike OK?"}
+        E5{"PPM zone MEDIUM or HIGH?"}
+        E6{"Candle signal direction?"}
+        E7{"Martingale cooldown elapsed?"}
     end
 
-    subgraph "Order Output"
-        O1[OrderSend → Broker]
-        O2[VslRegister → g_vsl[]]
-        O3[SaveState → DISK]
+    subgraph OUT["Order Output"]
+        O1["OrderSend to broker"]
+        O2["Register virtual SL entry"]
+        O3["Save full state to disk"]
+        O4["Flatten all positions on guard breach"]
     end
 
     TICK --> T1
@@ -222,138 +308,151 @@ graph TD
     T4 --> T5
     T5 --> T6
     T6 --> T7
+    T7 --> T8
 
     MT4 --> K1
     K1 --> K2
     K2 --> K3
+    K3 --> K4
 
-    K3 --> E1
-    E1 -->|Yes| E2
-    E1 -->|No| T7
-    E2 -->|Yes| E3
-    E2 -->|No| T7
-    E3 -->|Yes| E4
-    E3 -->|No| T7
-    E4 -->|Yes| E5
-    E4 -->|No| T7
-    E5 -->|Yes| E6
-    E5 -->|No| T7
-    E6 -->|Yes| E7
-    E6 -->|No| T7
-    E7 -->|Yes| O1
-    E7 -->|No| T7
+    K3 -->|breach| O4
+    O4 --> O3
+
+    K4 --> E1
+    E1 -->|yes| E2
+    E2 -->|yes| E3
+    E3 -->|yes| E4
+    E4 -->|yes| E5
+    E5 -->|yes| E6
+    E6 -->|signal| E7
+    E7 -->|yes| O1
 
     O1 --> O2
     O2 --> O3
-    DISK -->|LoadState| K3
+    DISK -->|load on init| K4
+    O3 --> DISK
 ```
 
 ---
 
-## UML Sequence Diagram
+## UML Sequence Diagrams
 
 ### Fresh Entry Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Timer as OnTimer()
-    participant Tick as OnTick()
-    participant Candle as Candle Engine
-    participant PPM as PPM Engine
-    participant Gate as Signal Gate
-    participant Equity as Equity Guard
-    participant Exec as Execution Module
-    participant VSL as Virtual SL Manager
-    participant Disk as State File
+    participant MT4
+    participant EA as CExpertAdvisor
+    participant Candle as CCandleEngine
+    participant PPM as CPpmEngine
+    participant Guard as CEquityGuard
+    participant Risk as CRiskModel
+    participant Exec as CTradeExecutor
+    participant VSL as CVirtualStopManager
+    participant Store as CStateStore
 
-    Timer->>Timer: Sample Ask → g_prices[]
-    Timer->>Timer: Update spread EMA
-    Timer->>PPM: CalcPPM()
-    PPM-->>Timer: g_ppm (zone, ppm)
-    Timer->>VSL: VslCheck()
-    Timer->>Timer: ManageTrailing()
-
-    MT4->>Tick: New M1 Bar
-    Tick->>Candle: RecognizeCandle(shift=1)
-    Candle-->>Tick: g_candle (type, trend)
-    Tick->>Gate: SignalDirection(g_candle)
-    Gate-->>Tick: dir (+1/-1/0)
-
-    Tick->>Gate: ManageEntries(allowFresh=true)
-    Gate->>Equity: EquityGuardOK()
-    Equity-->>Gate: true
-    Gate->>Gate: TradingWindowOpen?
-    Gate->>Gate: SpreadOK?
-    Gate->>Gate: VolumeOK?
-    Gate->>Gate: g_ppm.zone >= MEDIUM?
-    Gate->>Gate: dir != 0?
-
-    Gate->>Exec: OpenTrade(dir, lots)
-    Exec->>Exec: ResolveTradeParams(ATR)
-    Exec->>Exec: NormalizeLots()
-    Exec->>MT4: OrderSend(OP_BUY/SELL)
+    MT4->>EA: OnTick - new M1 bar
+    EA->>Candle: Recognize(shift=1)
+    Candle-->>EA: CANDLE_STRUCTURE
+    EA->>PPM: Calc()
+    PPM-->>EA: PPM_RESULT with zone
+    EA->>Guard: Breached()?
+    Guard-->>EA: false
+    EA->>EA: session open, spread OK, volume OK, zone >= MEDIUM
+    EA->>Candle: SignalDirection()
+    Candle-->>EA: dir = +1 or -1
+    EA->>Exec: Open(dir, base lots)
+    Exec->>Risk: Resolve() - ATR distances
+    Exec->>MT4: OrderSend with safety SL
     MT4-->>Exec: ticket
-    Exec->>VSL: VslRegister(ticket, vsl, be, safetySL)
-    Exec->>Disk: SaveState()
+    Exec->>VSL: Register(ticket, virtual SL, BE, safety)
+    EA->>Store: Save() - full state
 ```
 
 ### Martingale Re-Entry Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Tick as OnTick()
-    participant State as Trade State
-    participant Gate as Signal Gate
-    participant Equity as Equity Guard
-    participant Exec as Execution Module
-    participant VSL as Virtual SL Manager
-    participant Disk as State File
+    participant MT4
+    participant EA as CExpertAdvisor
+    participant Mart as CMartingaleController
+    participant Guard as CEquityGuard
+    participant Exec as CTradeExecutor
+    participant VSL as CVirtualStopManager
+    participant Store as CStateStore
 
-    MT4->>Tick: Position Closed (Loss)
-    Tick->>State: UpdateTradeState()
-    State->>State: profit < 0 ?
-    State->>State: g_await_reentry = true
-    State->>State: g_last_loss_time = now
-    State->>Disk: SaveState()
+    MT4->>EA: OnTick - position closed at a loss
+    EA->>Mart: OnPositionClosed(profit < 0)
+    Mart->>Mart: step < max? arm await-reentry, record loss time
+    EA->>Store: Save() - pending re-entry persisted
 
-    MT4->>Tick: New M1 Bar(s)
-    Tick->>Gate: ManageEntries(allowFresh=false)
-    Gate->>Gate: g_await_reentry == true?
-    Gate->>Gate: barsSinceLoss >= Cooldown?
-    Gate->>Equity: EquityGuardOK()
-    Equity-->>Gate: true
-    Gate->>Gate: VolumeOK?
-    Gate->>Gate: SpreadOK?
-    Gate->>Gate: Session open?
-
-    Gate->>Exec: OpenTrade(reDir, lots*Mult)
-    Exec->>Exec: ResolveTradeParams(ATR)
-    Exec->>MT4: OrderSend()
+    MT4->>EA: OnTick - later bars
+    EA->>Mart: CanReenter()? CooldownElapsed()?
+    Mart-->>EA: true
+    EA->>Guard: Breached()?
+    Guard-->>EA: false
+    EA->>EA: session open, spread OK, volume OK
+    EA->>Mart: ReentryDir(), ReentryLots(x multiplier)
+    EA->>Exec: Open(reDir, lots)
+    Exec->>MT4: OrderSend
     MT4-->>Exec: ticket
-    Exec->>VSL: VslRegister(ticket, vsl, be, safetySL)
-    Exec->>Disk: SaveState()
-
-    Gate->>State: g_mart_step++
-    State->>State: g_await_reentry = false
+    Exec->>VSL: Register(ticket, ...)
+    EA->>Mart: OnReentry() - step++
+    EA->>Store: Save()
 ```
 
 ### Equity Protection Trigger Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Tick as OnTick()
-    participant Equity as Equity Guard
-    participant State as Trade State
+    participant MT4
+    participant EA as CExpertAdvisor
+    participant Guard as CEquityGuard
+    participant Exec as CTradeExecutor
+    participant Mart as CMartingaleController
+    participant Clock as CSessionClock
+    participant Store as CStateStore
 
-    Tick->>Equity: EquityGuardOK()
-    Equity->>Equity: AccountEquity() < InpMinEquity?
-    Equity->>Equity: (balance - equity) / balance >= InpMaxDrawdownPct?
-    Equity-->>Tick: false (breached)
-    Tick->>State: HaltForToday()
-    State->>State: g_trading_halted = true
-    State->>State: g_halt_until = next_session_open
-    State->>Tick: TradingWindowOpen() returns false
-    Note over Tick: No entries until next session
+    MT4->>EA: OnTick - position open, equity falling
+    EA->>Guard: Breached()?
+    Guard->>Guard: equity < floor OR daily DD >= max %
+    Guard-->>EA: true with reason
+    alt InpCloseOnGuardBreach = true
+        EA->>Exec: CloseAll() - flatten immediately
+    end
+    EA->>Mart: ResetCycle()
+    EA->>Clock: NextSessionOpenGMT()
+    EA->>EA: halt until next session open
+    EA->>Store: Save() - halt persisted to disk
+    Note over EA: No entries until next session.<br/>Restarting the terminal does NOT lift the halt.
+```
+
+### Restart Recovery Sequence
+
+```mermaid
+sequenceDiagram
+    participant MT4
+    participant EA as CExpertAdvisor
+    participant Store as CStateStore
+    participant Guard as CEquityGuard
+    participant Mart as CMartingaleController
+    participant VSL as CVirtualStopManager
+
+    MT4->>EA: OnInit after restart
+    EA->>Store: Load()
+    Store->>Store: verify format tag - discard old formats
+    Store-->>EA: martingale cycle, halt state, baseline, VSL entries
+    EA->>VSL: drop closed or unknown tickets, clamp count
+    alt same local day
+        EA->>Guard: SetBaseline(saved baseline, day stamp)
+        opt halt still active
+            EA->>EA: restore halt until saved time
+        end
+    else new day
+        EA->>Guard: ResetBaseline(today)
+    end
+    EA->>Mart: pending re-entry and loss time restored
+    Note over EA: Daily protection survives restarts,<br/>chart re-attach, and VPS migration.
 ```
 
 ---
@@ -606,6 +705,7 @@ The file starts with a format tag; state files from v9 or older fail the tag che
 - **FIX: martingale step semantics** — the initial trade is step 0, so `InpMartMaxSteps` now truly equals the number of re-entries (previously off by one).
 - **NEW: `InpCloseOnGuardBreach`** — equity guards are evaluated on every tick, even with open positions, and can flatten immediately on breach (default true).
 - **Cleanup**: removed dead history-scan cache; day baseline also rolls on local-day change during multi-day runs; no state save after a failed init.
+- **Docs**: PRD refreshed (FR-019..022, NFR-007); ASCII architecture blueprint replaced with mermaid; Data Flow Diagram fixed (nested-bracket labels broke GitHub's mermaid renderer) and updated to the v10 flow; new Data Dictionary section (structures, enums, state-file format); UML limited to mermaid sequence diagrams, now four including Restart Recovery.
 
 ### v9.10
 - **Equity protection guards**: Added `InpMaxDrawdownPct` and `InpMinEquity` with daily session reset.
