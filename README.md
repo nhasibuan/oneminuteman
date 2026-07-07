@@ -22,6 +22,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 - [Adaptive Execution](#adaptive-execution)
 - [State Persistence](#state-persistence)
 - [Installation](#installation)
+- [User Guide](#user-guide)
 - [Inputs](#inputs)
 - [Risk Warnings](#risk-warnings)
 - [Changelog](#changelog)
@@ -138,7 +139,7 @@ graph TB
     subgraph PROT["Protection and State"]
         CLOCK["CSessionClock - timezone / session / day stamp"]
         GUARD["CEquityGuard - drawdown and equity floor"]
-        MART["CMartingaleController - recovery state machine"]
+        MART["CMartingaleController - centralized re-entry decision"]
         STORE["CStateStore - versioned binary persistence"]
     end
 
@@ -183,8 +184,8 @@ graph TB
 | **CRiskModel** | ATR-dynamic SL/TP/trailing/break-even distances | `Resolve()`, `AtrPips()` |
 | **CVirtualStopManager** | Hidden SL registry, enforcement with retry, tighten-only updates | `Register()`, `Enforce()`, `Tighten()` |
 | **CTrailingManager** | ATR trailing + break-even lock (virtual or broker SL) | `Manage()` |
-| **CMartingaleController** | Loss-recovery state machine with cooldown and step cap | `OnPositionClosed()`, `CanReenter()`, `ReentryDir()`, `ReentryLots()` |
-| **CTradeExecutor** | Order send with dynamic params, emergency flatten, history scan | `Open()`, `CloseAll()`, `CountPositions()`, `LastClosedProfit()` |
+| **CMartingaleController** | Loss-recovery state machine; **all** re-entry protections centralized in one decision point (v10.10) | `OnPositionClosed()`, `ReentryAllowed()`, `EntryPaused()`, `ReentryDir()`, `ReentryLots()` |
+| **CTradeExecutor** | Order send with dynamic params, emergency flatten, history scan | `Open()`, `CloseAll()`, `CountPositions()`, `LastClosedProfit(&closePrice)` |
 | **CStateStore** | Versioned binary save/load of full protection state (Memento) | `Save()`, `Load()` |
 
 ---
@@ -217,6 +218,12 @@ graph TB
 | `TRADE_PARAMS` | `tp_pips` `sl_pips` | `double` | Resolved TP / SL distances |
 | | `trail_start` `trail_step` | `double` | Trailing activation / step distances |
 | | `be_trigger` | `double` | Break-even trigger distance |
+| `REENTRY_CONTEXT` (v10.10) | `atr_pips` | `double` | Current ATR in pips (0 = unavailable) |
+| | `adx` | `double` | ADX(M1) on last closed bar (-1 = unavailable) |
+| | `price` | `double` | Current Bid |
+| | `candle_dir` | `int` | Candle signal direction (+1/-1/0) |
+| | `ppm_zone` | `int` | `PPM_ZONE` value, -1 = invalid |
+| | `new_bar_since_loss` | `bool` | At least one new M1 bar since the losing close |
 
 ### Enumerations
 
@@ -226,6 +233,7 @@ graph TB
 | `TYPE_CANDLESTICK` | `CAND_UNKNOWN`, `CAND_LONG`, `CAND_SHORT`, `CAND_DOJI`, `CAND_MARUBOZU`, `CAND_HAMMER`, `CAND_INVERTED_HAMMER`, `CAND_SPINNING_TOP`, `CAND_DRAGONFLY_DOJI`, `CAND_GRAVESTONE_DOJI`, `CAND_LONG_LEGGED_DOJI` |
 | `TYPE_TREND` | `TREND_UNKNOWN`, `TREND_UPPER`, `TREND_DOWN`, `TREND_LATERAL` |
 | `PPM_ZONE` | `PPM_ZONE_NONE`, `PPM_ZONE_LOW`, `PPM_ZONE_MEDIUM`, `PPM_ZONE_HIGH` |
+| `ENUM_MART_CONFIRM` (v10.10) | `MART_CONFIRM_NONE` (0), `MART_CONFIRM_CANDLE` (1), `MART_CONFIRM_PPM` (2), `MART_CONFIRM_EITHER` (3), `MART_CONFIRM_BOTH` (4) |
 
 ### State File Format — `OMM_State_<Symbol>_<Magic>.bin`
 
@@ -260,6 +268,9 @@ Full input tables live in [Inputs](#inputs); the data-critical ones:
 | `InpAtrSLMult` etc. | CRiskModel | Distance formulas |
 | `InpMartMaxSteps` | CMartingaleController | Number of re-entries |
 | `InpMaxDrawdownPct`, `InpMinEquity`, `InpCloseOnGuardBreach` | CEquityGuard / facade | Protection thresholds & breach behavior |
+| `InpMartCooldownSchedule`, `InpMartMultSchedule` | CMartingaleController | Progressive per-step cooldown / multiplier (parsed at init) |
+| `InpMaxConsecLosses`, `InpConsecLossPauseMin` | CMartingaleController | Consecutive-loss limiter pausing **all** entries |
+| `InpMartMaxADX`, `InpMartMinAtrDist`, `InpMartConfirm` | CMartingaleController | Trend block, ATR price spacing, reversal confirmation |
 
 ---
 
@@ -298,7 +309,7 @@ graph TD
         E4{"Volume spike OK?"}
         E5{"PPM zone MEDIUM or HIGH?"}
         E6{"Candle signal direction?"}
-        E7{"Martingale cooldown elapsed?"}
+        E7{"ReentryAllowed? - centralized v10.10 checks:<br/>pause, ATR step cap, progressive cooldown,<br/>ATR spacing, ADX block, reversal confirmation"}
     end
 
     subgraph OUT["Order Output"]
@@ -619,6 +630,87 @@ The file starts with a format tag; state files from v9 or older fail the tag che
 
 ---
 
+## User Guide
+
+### Quick Start (5 minutes)
+
+1. **Install** (see [Installation](#installation)) and compile in MetaEditor — expect **0 errors, 0 warnings**.
+2. Attach to an **M1 chart** of a major pair on a **demo account**. The EA forces M1 analysis regardless of chart timeframe.
+3. Leave every input at its default. Defaults are the tested, protected configuration.
+4. Watch the on-chart panel for one full session with `InpEnableTrading = false` — confirm PPM, candle patterns, and spread readings look sane for your broker.
+5. Set `InpEnableTrading = true` and let it run on demo for **at least 2–4 weeks** before considering anything else.
+
+### Reading the On-Chart Panel
+
+```
+=== OneMinuteMan v10.10 ===
+Symbol:EURUSD  Engines:M1 (forced)  Chart:M1
+--- Range ---            <- rolling tick High/Low window
+--- Candle ---           <- last classified pattern + trend
+PPM:1.25  Zone:MEDIUM    <- market efficiency (ZigZag pips/minute)
+--- Trade ---
+Trading:ON  Spread:12/32  Equity:$1000.00  DD:1.20%
+Open:1  Mart:2/5 (SAME) [AWAIT]
+ConsecLosses:2  Block:ATR price spacing
+Session: OPEN  HideSL:ON  VSLs:1
+```
+
+| Line | Meaning |
+|---|---|
+| `Spread:12/32` | Current spread / adaptive limit (points). Entries blocked above the limit |
+| `Mart:2/5 (SAME) [AWAIT]` | Martingale step 2 of max 5, same-direction mode, re-entry armed |
+| `ConsecLosses:2` | Cross-cycle loss streak. At `InpMaxConsecLosses` (default 3) **all** entries pause |
+| `PAUSED until hh:mm` | Consecutive-loss pause active — no entries, fresh or martingale |
+| `Block:<reason>` | Why the armed re-entry has not fired yet (cooldown, ATR spacing, ADX block, no reversal confirmation…) |
+| `HALTED until: <time>` | Daily halt active (guard breach or ladder exhausted). Survives restarts |
+
+### Choosing a Risk Profile
+
+| Input | Conservative | Default | Aggressive (demo only) |
+|---|---|---|---|
+| `InpUseMartingale` | **false** | true | true |
+| `InpMartMaxSteps` | 2 | 5 | 5 |
+| `InpMartMultSchedule` | `1.5,1.5` | `""` (fixed 2.0) | `2.0,1.8,1.6,1.4,1.2` |
+| `InpMartCooldownSchedule` | `2,3,5` | `0,1,2,3,5` | `0,1,2,3,5` |
+| `InpMaxConsecLosses` | 2 | 3 | 3 |
+| `InpMaxDrawdownPct` | 5 | 10 | 10 |
+| `InpMartConfirm` | `BOTH` | `EITHER` | `EITHER` |
+| `InpMartMaxADX` | 25 | 30 | 30 |
+
+Worst-case cumulative exposure with fixed 2.0 multiplier: 3× base lots at 1 step, 7× at 2, 63× at 5. Size `InpBaseLots` so the **full ladder** fits inside your `InpMaxDrawdownPct`.
+
+### What Happens After a Loss (v10.10 flow)
+
+1. Loss detected → streak +1, re-entry armed (if steps remain), losing close price recorded.
+2. If streak ≥ `InpMaxConsecLosses` → **all entries pause** for `InpConsecLossPauseMin` minutes.
+3. Otherwise, the re-entry must pass **every** centralized check: progressive cooldown → new-bar/ATR-spacing floor → ADX trend block → candle/PPM reversal confirmation → volume filter.
+4. If the last rung loses → trading halts for the day. If daily drawdown or the equity floor breaches at any tick → positions are flattened (`InpCloseOnGuardBreach`) and trading halts until next session.
+5. Any win resets both the ladder and the loss streak.
+
+### Frequently Asked Questions
+
+**The EA doesn't trade at all.** Check the panel: `Trading:OFF` (input disabled), `Session: CLOSED` (outside `InpSessionStartHour`–`InpSessionEndHour`, timezone offset `InpTzOffsetHours`), `HALTED` (daily protection), `Zone:LOW/NONE` (PPM too inefficient — this is by design), or spread above the adaptive limit.
+
+**`Mart` shows `[AWAIT]` but nothing happens.** Read the `Block:` reason on the panel — the centralized protections are holding the re-entry until conditions are safe. This is normal and intended.
+
+**Can I set `InpMartCooldownBars = 0`?** The fallback value only applies when `InpMartCooldownSchedule` is empty, and since v10.10 even a 0-bar cooldown cannot fire a same-bar re-entry unless price has moved ≥ ATR × `InpMartMinAtrDist` from the losing close. Negative values fail init.
+
+**Where is my stop-loss?** Hidden by default (`InpHideSL = true`): the EA enforces a virtual SL internally and sends only a wide safety SL to the broker. Disable `InpHideSL` to use plain broker stops.
+
+**I restarted the terminal — did I lose protection?** No. Ladder state, loss streak, pause, daily halt, and drawdown baseline are all restored from the state file (`OMM_State_<Symbol>_<Magic>.bin` in `MQL4/Files/`). Delete that file only if you deliberately want a factory reset.
+
+**Can I run it on multiple pairs?** Yes — one chart per symbol; state files are per symbol + magic. Use a distinct `InpMagic` per chart and remember the equity guards read **account-level** equity, so guards on any chart can halt that chart only.
+
+### Golden Rules
+
+1. **Demo first, always.** No live money until you have weeks of demo history.
+2. **Never disable the protections to "let it recover".** They exist because martingale's worst case is account-ending.
+3. Size `InpBaseLots` for the full ladder, not the first trade.
+4. Prefer ranging sessions; the ADX block helps, but don't fight it.
+5. After any large loss, review the log — every blocked re-entry prints its reason.
+
+---
+
 ## Inputs
 
 ### Range / Candle / PPM
@@ -743,6 +835,7 @@ The file starts with a format tag; state files from v9 or older fail the tag che
 - **Reversal confirmation**: re-entry must be confirmed by the candle engine and/or PPM zone (default: either) — recovery is no longer purely time-based.
 - **Validation**: `InpMartCooldownBars < 0` and inconsistent protection inputs now fail init with a clear error.
 - **State format bumped to `OMM4`** (`0x4F4D4D34`): adds loss streak, pause deadline, and last loss price. Old state files are discarded safely.
+- **Docs**: new User Guide (quick start, panel reference, risk profiles, loss-flow walkthrough, FAQ); Data Dictionary, DFD, and architecture tables synced to the v10.10 internals (`REENTRY_CONTEXT`, `ENUM_MART_CONFIRM`, OMM4 state file).
 
 ### v10.00
 - **Single-file component architecture**: full rewrite into 13 single-responsibility classes behind a `CExpertAdvisor` facade (`CSpreadMonitor`, `CRangeScanner`, `CCandleEngine`, `CPpmEngine`, `CVolumeFilter`, `CSessionClock`, `CEquityGuard`, `CRiskModel`, `CVirtualStopManager`, `CTrailingManager`, `CMartingaleController`, `CTradeExecutor`, `CStateStore`). No global mutable state; MT4 event handlers only delegate.
