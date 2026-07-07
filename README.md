@@ -34,7 +34,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | Field | Value |
 |---|---|
 | **Product Name** | OneMinuteMan |
-| **Version** | 10.00 |
+| **Version** | 10.10 |
 | **Platform** | MetaTrader 4 (MQL4) |
 | **Timeframe** | M1 (forced) |
 | **Strategy Type** | Scalping + Martingale Recovery |
@@ -67,6 +67,10 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | FR-020 | Evaluate equity guards on every tick, including with open positions | P0 | Implemented (v10) |
 | FR-021 | Optionally flatten all positions on guard breach (`InpCloseOnGuardBreach`) | P0 | Implemented (v10) |
 | FR-022 | Retry virtual-SL close on broker rejection instead of dropping protection | P0 | Implemented (v10) |
+| FR-023 | Centralize all martingale re-entry checks in a single decision point | P0 | Implemented (v10.10) |
+| FR-024 | Progressive per-step cooldown and decaying multiplier schedules | P1 | Implemented (v10.10) |
+| FR-025 | Consecutive-loss limiter pausing all entries, persisted across restarts | P0 | Implemented (v10.10) |
+| FR-026 | Block martingale during strong trends (ADX) and require price spacing / reversal confirmation | P0 | Implemented (v10.10) |
 
 ### PRD-003 — Non-Functional Requirements
 
@@ -229,12 +233,15 @@ Binary, written on every trade, every halt, and deinit. Read order:
 
 | # | Field | Type | Notes |
 |---|---|---|---|
-| 1 | Format tag | `int` | `0x4F4D4D33` — old/unknown tags are discarded safely |
+| 1 | Format tag | `int` | `0x4F4D4D34` ("OMM4") — old/unknown tags are discarded safely |
 | 2 | Martingale step | `int` | Initial trade = 0 |
 | 3 | Last direction | `int` | +1 / -1 |
 | 4 | Last lot size | `double` | |
 | 5 | Await-reentry flag | `int` | 0 / 1 |
 | 6 | Last loss time | `long` | Unix time |
+| 6a | Consecutive losses | `int` | Cross-cycle loss streak (v10.10) |
+| 6b | Pause-until time | `long` | Consecutive-loss pause deadline, Unix time (v10.10) |
+| 6c | Last loss price | `double` | Losing close price for ATR spacing (v10.10) |
 | 7 | Halted flag | `int` | 0 / 1 |
 | 8 | Halt-until time | `long` | GMT Unix time |
 | 9 | Drawdown baseline | `double` | Day-start balance |
@@ -387,12 +394,14 @@ sequenceDiagram
     EA->>Store: Save() - pending re-entry persisted
 
     MT4->>EA: OnTick - later bars
-    EA->>Mart: CanReenter()? CooldownElapsed()?
-    Mart-->>EA: true
     EA->>Guard: Breached()?
     Guard-->>EA: false
-    EA->>EA: session open, spread OK, volume OK
-    EA->>Mart: ReentryDir(), ReentryLots(x multiplier)
+    EA->>EA: session open, not paused, spread OK
+    EA->>Mart: ReentryAllowed(ctx) - centralized checks
+    Mart->>Mart: pause, ATR step cap, progressive cooldown,<br/>ATR spacing, ADX block, reversal confirmation
+    Mart-->>EA: true
+    EA->>EA: volume OK
+    EA->>Mart: ReentryDir(), ReentryLots(per-step multiplier)
     EA->>Exec: Open(reDir, lots)
     Exec->>MT4: OrderSend
     MT4-->>Exec: ticket
@@ -503,7 +512,7 @@ A fresh trade opens only when **all** conditions hold:
 
 ## Martingale Modes
 
-After a losing trade the EA enters a cooldown period (`InpMartCooldownBars`), then re-enters as soon as the volume filter passes. It re-enters with `InpMartMult` x the previous lot size. The re-entry direction is controlled by **`InpMartMode`**:
+After a losing trade the EA arms a re-entry. Since **v10.10 every martingale attempt passes through one centralized decision point** — `CMartingaleController::ReentryAllowed()` — which runs all protection checks in order of cost before any order is sent. The re-entry lot size comes from the per-step multiplier schedule (or fixed `InpMartMult`), and the direction is controlled by **`InpMartMode`**:
 
 | Mode | Value | Behavior |
 |---|---|---|
@@ -512,8 +521,21 @@ After a losing trade the EA enters a cooldown period (`InpMartCooldownBars`), th
 
 Both modes stop after `InpMartMaxSteps` **re-entries** (the initial trade is step 0) and then halt trading until the next session open. The halt itself is persisted to disk, so restarting the terminal does not lift it.
 
-### Martingale Cooldown
-`InpMartCooldownBars` (default 2) enforces a minimum number of M1 bars between martingale steps, reducing the risk of rapid-fire entries during choppy conditions.
+### Centralized Re-Entry Protections (v10.10)
+
+Every re-entry must pass **all** of these, evaluated inside `ReentryAllowed()`:
+
+| # | Check | Input(s) | Behavior |
+|---|---|---|---|
+| 1 | Consecutive-loss pause | `InpMaxConsecLosses`, `InpConsecLossPauseMin` | N losses in a row (across cycles, reset on any win) pause **all** entries — fresh and martingale — for the configured minutes. Persisted across restarts. |
+| 2 | ATR-adaptive step cap | `InpMartAtrLowPips`, `InpMartAtrHighPips` | High volatility reduces exposure: full steps at low ATR, one fewer at medium, only 2 above the high threshold. `0` disables. |
+| 3 | Progressive cooldown | `InpMartCooldownSchedule` (default `0,1,2,3,5`) | Per-step bar cooldown — slows down only as risk increases. Empty schedule falls back to fixed `InpMartCooldownBars`. |
+| 4 | New-bar / ATR spacing floor | `InpMartMinAtrDist` (default 0.5) | Even at a 0-bar cooldown, a same-bar re-entry requires price to have moved >= ATR x factor away from the losing close. Set to 0 to force a new M1 bar instead. Prevents rapid-fire entries within 2 pips. |
+| 5 | ADX trend block | `InpMartMaxADX` (default 30), `InpMartADXPeriod` | Martingale works best in ranging markets — no re-entry while ADX(M1) shows a strong trend. `0` disables. |
+| 6 | Reversal confirmation | `InpMartConfirm` (default `EITHER`) | Re-entry must be confirmed by the existing signal engines: candle signal agreeing with the re-entry direction and/or PPM zone >= MEDIUM. Modes: `NONE` / `CANDLE` / `PPM` / `EITHER` / `BOTH`. |
+
+### Decaying Multiplier Schedule
+`InpMartMultSchedule` (e.g. `2.0,1.8,1.6,1.4,1.2`) replaces the fixed multiplier with a per-step schedule — later rungs grow slower, cutting worst-case drawdown dramatically. Empty = fixed `InpMartMult`.
 
 ---
 
@@ -665,7 +687,21 @@ The file starts with a format tag; state files from v9 or older fail the tag che
 | `InpMartMode` | SAME_DIRECTION | Re-entry direction mode |
 | `InpMartMult` | 2.0 | Lot multiplier per step |
 | `InpMartMaxSteps` | 5 | Maximum martingale re-entries after the initial trade |
-| `InpMartCooldownBars` | 2 | Minimum bars between steps |
+| `InpMartCooldownBars` | 2 | Fallback cooldown bars (used when schedule empty) |
+
+### Martingale — Consecutive-Loss Protection (v10.10)
+| Input | Default | Description |
+|---|---|---|
+| `InpMartCooldownSchedule` | `0,1,2,3,5` | Progressive cooldown bars per step (`""` = fixed `InpMartCooldownBars`) |
+| `InpMartMultSchedule` | `""` | Lot multiplier per step, e.g. `2.0,1.8,1.6,1.4,1.2` (`""` = fixed `InpMartMult`) |
+| `InpMaxConsecLosses` | 3 | Pause **all** entries after N consecutive losses (0 = off) |
+| `InpConsecLossPauseMin` | 1 | Pause duration in minutes |
+| `InpMartMaxADX` | 30.0 | Block re-entry when ADX(M1) above this (0 = off) |
+| `InpMartADXPeriod` | 14 | ADX period for the trend block |
+| `InpMartMinAtrDist` | 0.5 | Same-bar re-entry needs price move >= ATR x this (0 = force new bar) |
+| `InpMartConfirm` | `EITHER` | Reversal confirmation: `NONE` / `CANDLE` / `PPM` / `EITHER` / `BOTH` |
+| `InpMartAtrLowPips` | 0 | ATR-adaptive steps: full steps at/below this ATR (0 = off) |
+| `InpMartAtrHighPips` | 0 | ATR-adaptive steps: only 2 steps above this ATR (0 = off) |
 
 ### Equity Protection
 | Input | Default | Description |
@@ -695,6 +731,18 @@ The file starts with a format tag; state files from v9 or older fail the tag che
 ---
 
 ## Changelog
+
+### v10.10 — Consecutive-Loss Protection
+- **Centralized decision point**: every martingale attempt now passes through `CMartingaleController::ReentryAllowed()` — one well-defined gate running all checks in order of cost.
+- **Progressive cooldown**: per-step bar schedule (`0,1,2,3,5` by default) — slows down only when risk increases.
+- **Consecutive-loss limiter**: N losses in a row (across cycles) pause **all** entries for a configurable number of minutes; streak and pause survive restarts.
+- **ADX trend block**: no martingale against a strong trend (default ADX > 30).
+- **ATR price-spacing floor**: same-bar re-entry requires price to move >= ATR x 0.5 from the losing close — even when the cooldown is 0 bars. No more four BUYs within 2 pips.
+- **Decaying multiplier schedule**: optional per-step multipliers (`2.0,1.8,1.6,1.4,1.2`) for much lower drawdown.
+- **ATR-adaptive max steps**: high volatility reduces the number of allowed rungs.
+- **Reversal confirmation**: re-entry must be confirmed by the candle engine and/or PPM zone (default: either) — recovery is no longer purely time-based.
+- **Validation**: `InpMartCooldownBars < 0` and inconsistent protection inputs now fail init with a clear error.
+- **State format bumped to `OMM4`** (`0x4F4D4D34`): adds loss streak, pause deadline, and last loss price. Old state files are discarded safely.
 
 ### v10.00
 - **Single-file component architecture**: full rewrite into 13 single-responsibility classes behind a `CExpertAdvisor` facade (`CSpreadMonitor`, `CRangeScanner`, `CCandleEngine`, `CPpmEngine`, `CVolumeFilter`, `CSessionClock`, `CEquityGuard`, `CRiskModel`, `CVirtualStopManager`, `CTrailingManager`, `CMartingaleController`, `CTradeExecutor`, `CStateStore`). No global mutable state; MT4 event handlers only delegate.
