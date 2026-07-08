@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/oneminuteman"
-#property version   "10.10"
+#property version   "10.11"
 #property strict
 #property description "OneMinuteMan v10: Forced-M1 range + candle + PPM engine, rebuilt as a"
 #property description "single-file component architecture. ATR-dynamic risk, virtual SL with"
@@ -1045,8 +1045,17 @@ public:
             return Block("ATR price spacing");
       }
 
-      // 3. trend block: don't martingale against a strong trend
-      if(m_max_adx > 0.0 && ctx.adx > m_max_adx)  return Block("ADX trend block");
+      // 3. trend gate -- mode-aware (v10.11):
+      //    SAME    : don't average AGAINST a strong trend  -> block when ADX above limit
+      //    REVERSE : only reverse WITH a confirmed trend   -> block when ADX below limit
+      //    Skipped when disabled (limit <= 0) or ADX unavailable (iADX error -> 0),
+      //    so a data failure can never dead-lock the REVERSE gate.
+      if(m_max_adx > 0.0 && ctx.adx > 0.0) {
+         if(m_mode == MART_SAME_DIRECTION && ctx.adx > m_max_adx)
+            return Block("ADX trend block");
+         if(m_mode == MART_REVERSE_DIRECTION && ctx.adx < m_max_adx)
+            return Block("ADX too low (reverse needs trend)");
+      }
 
       // 4. reversal confirmation via existing signal engines
       if(!ConfirmationOK(ctx))                    return Block("no reversal confirmation");
