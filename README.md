@@ -72,6 +72,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | FR-024 | Progressive per-step cooldown and decaying multiplier schedules | P1 | Implemented (v10.10) |
 | FR-025 | Consecutive-loss limiter pausing all entries, persisted across restarts | P0 | Implemented (v10.10) |
 | FR-026 | Block martingale during strong trends (ADX) and require price spacing / reversal confirmation | P0 | Implemented (v10.10) |
+| FR-027 | Mode-aware ADX gate: SAME blocks in strong trends, REVERSE requires a confirmed trend | P0 | Implemented (v10.11) |
 
 ### PRD-003 — Non-Functional Requirements
 
@@ -219,7 +220,7 @@ graph TB
 | | `trail_start` `trail_step` | `double` | Trailing activation / step distances |
 | | `be_trigger` | `double` | Break-even trigger distance |
 | `REENTRY_CONTEXT` (v10.10) | `atr_pips` | `double` | Current ATR in pips (0 = unavailable) |
-| | `adx` | `double` | ADX(M1) on last closed bar (-1 = unavailable) |
+| | `adx` | `double` | ADX(M1) on last closed bar (0 = unavailable / iADX error → gate skipped) |
 | | `price` | `double` | Current Bid |
 | | `candle_dir` | `int` | Candle signal direction (+1/-1/0) |
 | | `ppm_zone` | `int` | `PPM_ZONE` value, -1 = invalid |
@@ -542,7 +543,7 @@ Every re-entry must pass **all** of these, evaluated inside `ReentryAllowed()`:
 | 2 | ATR-adaptive step cap | `InpMartAtrLowPips`, `InpMartAtrHighPips` | High volatility reduces exposure: full steps at low ATR, one fewer at medium, only 2 above the high threshold. `0` disables. |
 | 3 | Progressive cooldown | `InpMartCooldownSchedule` (default `0,1,2,3,5`) | Per-step bar cooldown — slows down only as risk increases. Empty schedule falls back to fixed `InpMartCooldownBars`. |
 | 4 | New-bar / ATR spacing floor | `InpMartMinAtrDist` (default 0.5) | Even at a 0-bar cooldown, a same-bar re-entry requires price to have moved >= ATR x factor away from the losing close. Set to 0 to force a new M1 bar instead. Prevents rapid-fire entries within 2 pips. |
-| 5 | ADX trend block | `InpMartMaxADX` (default 30), `InpMartADXPeriod` | Martingale works best in ranging markets — no re-entry while ADX(M1) shows a strong trend. `0` disables. |
+| 5 | ADX trend gate (mode-aware, v10.11) | `InpMartMaxADX` (default 30), `InpMartADXPeriod` | SAME: no re-entry while ADX(M1) is **above** the limit (don't average against a trend). REVERSE: no re-entry while ADX is **below** the limit (only reverse *with* a confirmed trend). `0` or ADX unavailable disables. |
 | 6 | Reversal confirmation | `InpMartConfirm` (default `EITHER`) | Re-entry must be confirmed by the existing signal engines: candle signal agreeing with the re-entry direction and/or PPM zone >= MEDIUM. Modes: `NONE` / `CANDLE` / `PPM` / `EITHER` / `BOTH`. |
 
 ### Decaying Multiplier Schedule
@@ -683,7 +684,7 @@ Worst-case cumulative exposure with fixed 2.0 multiplier: 3× base lots at 1 ste
 
 1. Loss detected → streak +1, re-entry armed (if steps remain), losing close price recorded.
 2. If streak ≥ `InpMaxConsecLosses` → **all entries pause** for `InpConsecLossPauseMin` minutes.
-3. Otherwise, the re-entry must pass **every** centralized check: progressive cooldown → new-bar/ATR-spacing floor → ADX trend block → candle/PPM reversal confirmation → volume filter.
+3. Otherwise, the re-entry must pass **every** centralized check: progressive cooldown → new-bar/ATR-spacing floor → mode-aware ADX trend gate → candle/PPM reversal confirmation → volume filter.
 4. If the last rung loses → trading halts for the day. If daily drawdown or the equity floor breaches at any tick → positions are flattened (`InpCloseOnGuardBreach`) and trading halts until next session.
 5. Any win resets both the ladder and the loss streak.
 
@@ -788,7 +789,7 @@ Worst-case cumulative exposure with fixed 2.0 multiplier: 3× base lots at 1 ste
 | `InpMartMultSchedule` | `""` | Lot multiplier per step, e.g. `2.0,1.8,1.6,1.4,1.2` (`""` = fixed `InpMartMult`) |
 | `InpMaxConsecLosses` | 3 | Pause **all** entries after N consecutive losses (0 = off) |
 | `InpConsecLossPauseMin` | 1 | Pause duration in minutes |
-| `InpMartMaxADX` | 30.0 | Block re-entry when ADX(M1) above this (0 = off) |
+| `InpMartMaxADX` | 30.0 | Mode-aware trend gate (v10.11). SAME: block re-entry when ADX(M1) above this. REVERSE: block when ADX below this. 0 = off |
 | `InpMartADXPeriod` | 14 | ADX period for the trend block |
 | `InpMartMinAtrDist` | 0.5 | Same-bar re-entry needs price move >= ATR x this (0 = force new bar) |
 | `InpMartConfirm` | `EITHER` | Reversal confirmation: `NONE` / `CANDLE` / `PPM` / `EITHER` / `BOTH` |
@@ -824,11 +825,17 @@ Worst-case cumulative exposure with fixed 2.0 multiplier: 3× base lots at 1 ste
 
 ## Changelog
 
+### v10.11 — Mode-Aware ADX Trend Gate
+
+- **ADX gate is now direction-aware.** SAME-direction martingale keeps the original behavior (block when ADX > `InpMartMaxADX` — never average against a strong trend). REVERSE-direction martingale inverts the check (block when ADX < `InpMartMaxADX` — only reverse *with* a confirmed trend), fixing the design gap where the block starved reverse recovery of exactly its best moments.
+- **Fail-open on data errors:** the gate is skipped when ADX is unavailable (`iADX` error returns 0), so a data failure can never dead-lock REVERSE re-entries.
+- New panel block reason: `ADX too low (reverse needs trend)`.
+
 ### v10.10 — Consecutive-Loss Protection
 - **Centralized decision point**: every martingale attempt now passes through `CMartingaleController::ReentryAllowed()` — one well-defined gate running all checks in order of cost.
 - **Progressive cooldown**: per-step bar schedule (`0,1,2,3,5` by default) — slows down only when risk increases.
 - **Consecutive-loss limiter**: N losses in a row (across cycles) pause **all** entries for a configurable number of minutes; streak and pause survive restarts.
-- **ADX trend block**: no martingale against a strong trend (default ADX > 30).
+- **ADX trend gate (mode-aware since v10.11)**: SAME mode never averages against a strong trend (blocks when ADX > limit); REVERSE mode only reverses with a confirmed trend (blocks when ADX < limit).
 - **ATR price-spacing floor**: same-bar re-entry requires price to move >= ATR x 0.5 from the losing close — even when the cooldown is 0 bars. No more four BUYs within 2 pips.
 - **Decaying multiplier schedule**: optional per-step multipliers (`2.0,1.8,1.6,1.4,1.2`) for much lower drawdown.
 - **ATR-adaptive max steps**: high volatility reduces the number of allowed rungs.
