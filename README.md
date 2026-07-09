@@ -35,7 +35,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | Field | Value |
 |---|---|
 | **Product Name** | OneMinuteMan |
-| **Version** | 10.10 |
+| **Version** | 10.11 |
 | **Platform** | MetaTrader 4 (MQL4) |
 | **Timeframe** | M1 (forced) |
 | **Strategy Type** | Scalping + Martingale Recovery |
@@ -73,6 +73,7 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | FR-025 | Consecutive-loss limiter pausing all entries, persisted across restarts | P0 | Implemented (v10.10) |
 | FR-026 | Block martingale during strong trends (ADX) and require price spacing / reversal confirmation | P0 | Implemented (v10.10) |
 | FR-027 | Mode-aware ADX gate: SAME blocks in strong trends, REVERSE requires a confirmed trend | P0 | Implemented (v10.11) |
+| FR-028 | Auto-derive ATR-adaptive step thresholds and suggest ADX from recent M1 bars (`InpAutoCalibrateMartAtr`) | P1 | Implemented (v10.11) |
 
 ### PRD-003 — Non-Functional Requirements
 
@@ -85,6 +86,8 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 | NFR-005 | Graceful degradation on missing ZigZag | Fail on init |
 | NFR-006 | State recovery time | < 100ms |
 | NFR-007 | State file format | Versioned (tagged); old formats discarded safely |
+| NFR-008 | Runtime ATR/ADX indicator errors | Fail open: retain manual ATR thresholds and skip unavailable ADX data |
+| NFR-009 | Mutable runtime state | Owned by the 13 SRP components; no global mutable state |
 
 ### PRD-004 — Signal Entry Conditions (ALL must be true)
 1. Trading enabled (`InpEnableTrading = true`)
@@ -98,77 +101,56 @@ A MetaTrader 4 Expert Advisor (MQL4) that forces all analysis onto the **M1 (1-m
 
 ### PRD-005 — Martingale Re-Entry Conditions (ALL must be true)
 1. Previous trade was a loss
-2. Martingale step < max steps (initial trade = step 0, so max steps = number of re-entries)
-3. Martingale cooldown bars elapsed
-4. Volume filter passes
-5. Equity guard passes
-6. Session is open
-7. Spread is acceptable
+2. Consecutive-loss pause is inactive
+3. Martingale step is below `EffectiveMaxSteps()` for the current ATR
+4. Progressive cooldown has elapsed
+5. A new M1 bar exists or the ATR price-spacing floor is met
+6. The mode-aware ADX gate passes or ADX is unavailable
+7. Reversal confirmation passes
+8. Volume filter and equity guard pass
+9. Session is open and spread is acceptable
 
 ---
 
 ## Architecture Blueprint
 
-Single `.mq4` file, component-based. The MT4 event handlers delegate to a **`CExpertAdvisor` facade**, which wires 13 single-responsibility components.
+Single `.mq4` file, component-based. The MT4 event handlers delegate to a **`CExpertAdvisor` facade**, which owns and coordinates 13 single-responsibility components. Initialization wiring is explicit and ordered:
 
 ```mermaid
-graph TB
-    subgraph EVT["MT4 Event Layer"]
-        ONINIT["OnInit"]
-        ONTICK["OnTick"]
-        ONTIMER["OnTimer every 50 ms"]
-        ONDEINIT["OnDeinit"]
-    end
+sequenceDiagram
+    participant MT4 as "MT4 OnInit"
+    participant EA as "CExpertAdvisor facade"
+    participant Spread as "CSpreadMonitor"
+    participant Range as "CRangeScanner"
+    participant Candle as "CCandleEngine"
+    participant PPM as "CPpmEngine"
+    participant Volume as "CVolumeFilter"
+    participant Clock as "CSessionClock"
+    participant Guard as "CEquityGuard"
+    participant Risk as "CRiskModel"
+    participant VSL as "CVirtualStopManager"
+    participant Trail as "CTrailingManager"
+    participant Mart as "CMartingaleController"
+    participant Exec as "CTradeExecutor"
+    participant Store as "CStateStore"
 
-    FACADE["CExpertAdvisor - Facade"]
-
-    subgraph SIG["Signal Engines"]
-        RANGE["CRangeScanner - rolling tick High/Low"]
-        CANDLE["CCandleEngine - pattern + trend + signal"]
-        PPM["CPpmEngine - ZigZag pips-per-minute"]
-        VOL["CVolumeFilter - tick-volume spike gate"]
-    end
-
-    subgraph EXE["Execution and Risk"]
-        SPREAD["CSpreadMonitor - adaptive spread and slippage"]
-        RISK["CRiskModel - ATR-dynamic SL/TP/trailing"]
-        EXEC["CTradeExecutor - order send / flatten / history"]
-        VSL["CVirtualStopManager - hidden SL registry"]
-        TRAIL["CTrailingManager - break-even + trailing"]
-    end
-
-    subgraph PROT["Protection and State"]
-        CLOCK["CSessionClock - timezone / session / day stamp"]
-        GUARD["CEquityGuard - drawdown and equity floor"]
-        MART["CMartingaleController - centralized re-entry decision"]
-        STORE["CStateStore - versioned binary persistence"]
-    end
-
-    ONINIT --> FACADE
-    ONTICK --> FACADE
-    ONTIMER --> FACADE
-    ONDEINIT --> FACADE
-
-    FACADE --> RANGE
-    FACADE --> CANDLE
-    FACADE --> PPM
-    FACADE --> VOL
-    FACADE --> SPREAD
-    FACADE --> RISK
-    FACADE --> EXEC
-    FACADE --> VSL
-    FACADE --> TRAIL
-    FACADE --> CLOCK
-    FACADE --> GUARD
-    FACADE --> MART
-    FACADE --> STORE
-
-    EXEC --> RISK
-    EXEC --> VSL
-    TRAIL --> RISK
-    TRAIL --> VSL
-    STORE --> MART
-    STORE --> VSL
+    MT4->>EA: OnInitHandler()
+    EA->>Spread: Init(execution adaptation)
+    EA->>Range: Init(tick buffer)
+    EA->>Candle: Init(candle period)
+    EA->>PPM: Init(ZigZag and PPM settings)
+    EA->>Volume: Init(volume gate)
+    EA->>Clock: Init(session settings)
+    EA->>Guard: Init(equity limits)
+    EA->>Risk: Init(ATR risk settings)
+    EA->>VSL: Init(virtual-stop mode)
+    EA->>Trail: Init(trailing and break-even)
+    EA->>Mart: Init(recovery protections)
+    EA->>Exec: Init(order settings)
+    EA->>Store: Init(state-file identity)
+    EA->>PPM: VerifyIndicator()
+    PPM-->>EA: ZigZag ready or init failure
+    EA->>Store: Load persisted state
 ```
 
 ### Component Responsibilities
@@ -185,7 +167,7 @@ graph TB
 | **CRiskModel** | ATR-dynamic SL/TP/trailing/break-even distances | `Resolve()`, `AtrPips()` |
 | **CVirtualStopManager** | Hidden SL registry, enforcement with retry, tighten-only updates | `Register()`, `Enforce()`, `Tighten()` |
 | **CTrailingManager** | ATR trailing + break-even lock (virtual or broker SL) | `Manage()` |
-| **CMartingaleController** | Loss-recovery state machine; **all** re-entry protections centralized in one decision point (v10.10) | `OnPositionClosed()`, `ReentryAllowed()`, `EntryPaused()`, `ReentryDir()`, `ReentryLots()` |
+| **CMartingaleController** | Loss-recovery state machine; **all** re-entry protections centralized in one decision point (v10.10) | `OnPositionClosed()`, `ReentryAllowed()`, `SetAtrThresholds()`, `EntryPaused()`, `ReentryDir()`, `ReentryLots()` |
 | **CTradeExecutor** | Order send with dynamic params, emergency flatten, history scan | `Open()`, `CloseAll()`, `CountPositions()`, `LastClosedProfit(&closePrice)` |
 | **CStateStore** | Versioned binary save/load of full protection state (Memento) | `Save()`, `Load()` |
 
@@ -258,98 +240,115 @@ Binary, written on every trade, every halt, and deinit. Read order:
 | 11 | VSL entry count | `int` | Clamped to capacity on load |
 | 12+ | Per VSL entry | `int, int, double, double, double` | ticket, dir, vsl, be, safety |
 
-### Key Inputs Cross-Reference
+### Input Parameters
 
-Full input tables live in [Inputs](#inputs); the data-critical ones:
+This table is sourced from the complete MQL4 `input` block.
 
-| Input | Consumed by | Effect |
-|---|---|---|
-| `InpWindowSize` | CRangeScanner | Circular buffer capacity |
-| `InpZzDepth/Deviation/Backstep` | CPpmEngine | ZigZag pivot parameters |
-| `InpAtrSLMult` etc. | CRiskModel | Distance formulas |
-| `InpMartMaxSteps` | CMartingaleController | Number of re-entries |
-| `InpMaxDrawdownPct`, `InpMinEquity`, `InpCloseOnGuardBreach` | CEquityGuard / facade | Protection thresholds & breach behavior |
-| `InpMartCooldownSchedule`, `InpMartMultSchedule` | CMartingaleController | Progressive per-step cooldown / multiplier (parsed at init) |
-| `InpMaxConsecLosses`, `InpConsecLossPauseMin` | CMartingaleController | Consecutive-loss limiter pausing **all** entries |
-| `InpMartMaxADX`, `InpMartMinAtrDist`, `InpMartConfirm` | CMartingaleController | Trend block, ATR price spacing, reversal confirmation |
+| Name | Type | Default | Meaning |
+|---|---|---|---|
+| `InpSampleMs` | `int` | `50` | Tick sampling interval in milliseconds |
+| `InpWindowSize` | `int` | `1200` | Rolling tick-buffer capacity |
+| `InpAverPeriod` | `int` | `14` | SMA and average candle-body period |
+| `InpZzDepth` | `int` | `2` | ZigZag depth |
+| `InpZzDeviation` | `int` | `2` | ZigZag deviation |
+| `InpZzBackstep` | `int` | `1` | ZigZag backstep |
+| `InpZzLookback` | `int` | `100` | M1 bars scanned for ZigZag pivots |
+| `InpPpmMinHigh` | `double` | `2.0` | Lower PPM efficiency threshold |
+| `InpPpmTarget` | `double` | `4.0` | Target PPM efficiency threshold |
+| `InpAtrDailyRef` | `double` | `1.5` | Display-only PPM volatility reference |
+| `InpShowPPM` | `bool` | `true` | Show PPM in the on-chart panel |
+| `InpUseVolumeFilter` | `bool` | `true` | Enable the tick-volume spike gate |
+| `InpVolLookback` | `int` | `20` | Bars used for average tick volume |
+| `InpVolMultiplier` | `double` | `1.5` | Required volume-to-average multiplier |
+| `InpEnableTrading` | `bool` | `false` | Master order-entry switch |
+| `InpBaseLots` | `double` | `0.01` | Initial trade lot size |
+| `InpSlippage` | `int` | `0` | Fixed slippage in points; `0` uses adaptive value |
+| `InpMaxSpread` | `int` | `0` | Fixed max spread in points; `0` uses adaptive value |
+| `InpMagic` | `int` | `202506` | Magic number and state-file identity |
+| `InpTP_Pips` | `double` | `0` | Fixed take-profit pips; `0` uses ATR |
+| `InpSL_Pips` | `double` | `0` | Fixed stop-loss pips; `0` uses ATR |
+| `InpHideSL` | `bool` | `true` | Enforce the primary stop locally as a virtual SL |
+| `InpTrailStart` | `double` | `0` | Fixed trailing trigger pips; `0` uses ATR |
+| `InpTrailStep` | `double` | `0` | Fixed trailing distance pips; `0` uses ATR |
+| `InpBE_TriggerMult` | `double` | `1.0` | Break-even trigger as an ATR multiple |
+| `InpBE_LockPips` | `double` | `1.0` | Profit pips locked at break-even |
+| `InpUseSafetySL` | `bool` | `true` | Send a wide broker-side disconnect stop |
+| `InpSafetySLMult` | `double` | `5.0` | Safety-stop distance as a virtual-SL multiple |
+| `InpAtrPeriod` | `int` | `14` | M1 ATR period for risk and calibration |
+| `InpAtrSLMult` | `double` | `1.5` | ATR stop-loss multiplier |
+| `InpAtrTPMult` | `double` | `2.0` | ATR take-profit multiplier |
+| `InpAtrTrailStartMult` | `double` | `1.0` | ATR trailing activation multiplier |
+| `InpAtrTrailStepMult` | `double` | `0.5` | ATR trailing-distance multiplier |
+| `InpMinRiskPips` | `double` | `1.0` | Minimum resolved risk distance |
+| `InpMaxSpreadMult` | `double` | `2.5` | Adaptive max-spread EMA multiplier |
+| `InpSlippageMult` | `double` | `1.5` | Adaptive slippage EMA multiplier |
+| `InpSprEmaAlpha` | `double` | `0.05` | Spread EMA smoothing factor |
+| `InpUseMartingale` | `bool` | `true` | Enable loss-recovery re-entry |
+| `InpMartMode` | `ENUM_MART_MODE` | `MART_SAME_DIRECTION` | Same-direction or reverse-direction recovery |
+| `InpMartMult` | `double` | `2.0` | Fixed fallback lot multiplier |
+| `InpMartMaxSteps` | `int` | `5` | Maximum re-entries after the initial trade |
+| `InpMartCooldownBars` | `int` | `2` | Fixed fallback cooldown when schedule is empty |
+| `InpMartCooldownSchedule` | `string` | `"0,1,2,3,5"` | Per-step cooldown bars |
+| `InpMartMultSchedule` | `string` | `""` | Optional per-step lot multipliers |
+| `InpMaxConsecLosses` | `int` | `3` | Loss streak that pauses all entries; `0` disables |
+| `InpConsecLossPauseMin` | `int` | `1` | Consecutive-loss pause duration |
+| `InpMartMaxADX` | `double` | `30.0` | Manual mode-aware ADX gate threshold; `0` disables |
+| `InpMartADXPeriod` | `int` | `14` | M1 ADX period |
+| `InpMartMinAtrDist` | `double` | `0.5` | Same-bar price-spacing floor as an ATR multiple |
+| `InpMartConfirm` | `ENUM_MART_CONFIRM` | `MART_CONFIRM_EITHER` | Candle/PPM confirmation policy |
+| `InpMartAtrLowPips` | `int` | `0` | Manual low ATR step-cap threshold; `0` disables |
+| `InpMartAtrHighPips` | `int` | `0` | Manual high ATR step-cap threshold; `0` disables |
+| `InpAutoCalibrateMartAtr` | `bool` | `false` | Apply M1 ATR p50/p85 thresholds and print a mode-aware ADX suggestion |
+| `InpMaxDrawdownPct` | `double` | `10.0` | Daily drawdown percentage that triggers a halt |
+| `InpMinEquity` | `double` | `100.0` | Absolute equity floor |
+| `InpCloseOnGuardBreach` | `bool` | `true` | Flatten EA positions when an equity guard breaches |
+| `InpTzOffsetHours` | `int` | `7` | Local-session UTC offset |
+| `InpSessionStartHour` | `int` | `5` | Local session start hour |
+| `InpSessionEndHour` | `int` | `24` | Local session end hour; `24` means midnight |
 
 ---
 
 ## Data Flow Diagram
 
 ```mermaid
-graph TD
-    subgraph EXT["External Inputs"]
-        TICK["Tick feed: Ask, Bid, tick volume"]
-        MT4["MT4 server: rates and history"]
-        DISK["State file: versioned binary"]
+sequenceDiagram
+    participant Tick as "MT4 tick"
+    participant EA as "CExpertAdvisor facade"
+    participant Spread as "CSpreadMonitor"
+    participant Range as "CRangeScanner"
+    participant Candle as "CCandleEngine"
+    participant PPM as "CPpmEngine"
+    participant Volume as "CVolumeFilter"
+    participant Mart as "CMartingaleController"
+    participant Risk as "CRiskModel"
+    participant Exec as "CTradeExecutor"
+    participant VSL as "CVirtualStopManager"
+    participant Trail as "CTrailingManager"
+    participant Store as "CStateStore"
+
+    Tick->>EA: OnTickHandler()
+    EA->>Spread: Update and check adaptive spread
+    EA->>Range: Read rolling sampled range
+    EA->>Candle: Recognize closed M1 candle
+    EA->>PPM: Read M1 PPM zone
+    EA->>Volume: Check tick-volume gate
+    Candle-->>EA: Directional candle signal
+    PPM-->>EA: Efficiency zone
+    Volume-->>EA: Volume accepted or blocked
+    alt Pending martingale re-entry
+        EA->>Mart: ReentryAllowed(context)
+        Mart-->>EA: Allowed direction and lot rung or block reason
+    else Fresh entry
+        EA->>Mart: EntryPaused()
+        Mart-->>EA: Fresh-entry pause state
     end
-
-    subgraph TIMER["OnTimer loop - every 50 ms"]
-        T1["Sample Ask into circular tick buffer"]
-        T2["Update rolling spread EMA"]
-        T3["Rescan rolling High/Low range"]
-        T4["Recompute PPM from ZigZag pivots"]
-        T5["Roll drawdown baseline on day change"]
-        T6["Manage trailing and break-even"]
-        T7["Enforce virtual SL - close or retry"]
-        T8["Refresh on-chart panel"]
-    end
-
-    subgraph TICKLOOP["OnTick loop - new M1 bar"]
-        K1["Recognize closed candle"]
-        K2["Update trade state - detect closed position"]
-        K3["Equity guard check - even with open position"]
-        K4["Manage entries"]
-    end
-
-    subgraph GATES["Entry Decision Gates"]
-        E1{"Equity guard OK?"}
-        E2{"Session open and not halted?"}
-        E3{"Spread within adaptive limit?"}
-        E4{"Volume spike OK?"}
-        E5{"PPM zone MEDIUM or HIGH?"}
-        E6{"Candle signal direction?"}
-        E7{"ReentryAllowed? - centralized v10.10 checks:<br/>pause, ATR step cap, progressive cooldown,<br/>ATR spacing, ADX block, reversal confirmation"}
-    end
-
-    subgraph OUT["Order Output"]
-        O1["OrderSend to broker"]
-        O2["Register virtual SL entry"]
-        O3["Save full state to disk"]
-        O4["Flatten all positions on guard breach"]
-    end
-
-    TICK --> T1
-    TICK --> T2
-    T1 --> T3
-    T3 --> T4
-    T4 --> T5
-    T5 --> T6
-    T6 --> T7
-    T7 --> T8
-
-    MT4 --> K1
-    K1 --> K2
-    K2 --> K3
-    K3 --> K4
-
-    K3 -->|breach| O4
-    O4 --> O3
-
-    K4 --> E1
-    E1 -->|yes| E2
-    E2 -->|yes| E3
-    E3 -->|yes| E4
-    E4 -->|yes| E5
-    E5 -->|yes| E6
-    E6 -->|signal| E7
-    E7 -->|yes| O1
-
-    O1 --> O2
-    O2 --> O3
-    DISK -->|load on init| K4
-    O3 --> DISK
+    EA->>Risk: Resolve ATR SL, TP, trailing, and break-even
+    Risk-->>EA: Trade parameters
+    EA->>Exec: Open(direction, lots, risk)
+    Exec->>VSL: Register hidden stop if enabled
+    EA->>Trail: Manage break-even and trailing
+    Trail->>VSL: Tighten virtual stop when applicable
+    EA->>Store: Save martingale, halt, baseline, and VSL state
 ```
 
 ---
@@ -360,79 +359,127 @@ graph TD
 
 ```mermaid
 sequenceDiagram
-    participant MT4
-    participant EA as CExpertAdvisor
-    participant Candle as CCandleEngine
-    participant PPM as CPpmEngine
-    participant Guard as CEquityGuard
-    participant Risk as CRiskModel
-    participant Exec as CTradeExecutor
-    participant VSL as CVirtualStopManager
-    participant Store as CStateStore
+    participant MT4 as "MT4 runtime"
+    participant EA as "CExpertAdvisor facade"
+    participant Spread as "CSpreadMonitor"
+    participant Guard as "CEquityGuard"
+    participant Candle as "CCandleEngine"
+    participant PPM as "CPpmEngine"
+    participant Volume as "CVolumeFilter"
+    participant Mart as "CMartingaleController"
+    participant Risk as "CRiskModel"
+    participant Exec as "CTradeExecutor"
+    participant VSL as "CVirtualStopManager"
+    participant Store as "CStateStore"
 
-    MT4->>EA: OnTick - new M1 bar
-    EA->>Candle: Recognize(shift=1)
-    Candle-->>EA: CANDLE_STRUCTURE
-    EA->>PPM: Calc()
-    PPM-->>EA: PPM_RESULT with zone
-    EA->>Guard: Breached()?
+    MT4->>EA: OnTick on a new M1 bar
+    EA->>Guard: Breached()
     Guard-->>EA: false
-    EA->>EA: session open, spread OK, volume OK, zone >= MEDIUM
-    EA->>Candle: SignalDirection()
-    Candle-->>EA: dir = +1 or -1
-    EA->>Exec: Open(dir, base lots)
-    Exec->>Risk: Resolve() - ATR distances
-    Exec->>MT4: OrderSend with safety SL
+    EA->>Mart: EntryPaused()
+    Mart-->>EA: false
+    EA->>Spread: SpreadOK()
+    Spread-->>EA: true
+    EA->>Candle: Recognize(shift 1) and SignalDirection()
+    Candle-->>EA: direction
+    EA->>PPM: Calc()
+    PPM-->>EA: MEDIUM or HIGH zone
+    EA->>Volume: Ok()
+    Volume-->>EA: true
+    EA->>Risk: Resolve()
+    Risk-->>EA: ATR-based trade parameters
+    EA->>Exec: Open(direction, base lots, risk)
+    Exec->>MT4: OrderSend with optional safety SL
     MT4-->>Exec: ticket
-    Exec->>VSL: Register(ticket, virtual SL, BE, safety)
-    EA->>Store: Save() - full state
+    Exec->>VSL: Register virtual SL and break-even levels
+    EA->>Mart: OnFreshEntry(direction, lots)
+    EA->>Store: Save()
 ```
 
 ### Martingale Re-Entry Sequence
 
 ```mermaid
 sequenceDiagram
-    participant MT4
-    participant EA as CExpertAdvisor
-    participant Mart as CMartingaleController
-    participant Guard as CEquityGuard
-    participant Exec as CTradeExecutor
-    participant VSL as CVirtualStopManager
-    participant Store as CStateStore
+    participant MT4 as "MT4 runtime"
+    participant EA as "CExpertAdvisor facade"
+    participant Mart as "CMartingaleController"
+    participant Risk as "CRiskModel"
+    participant Exec as "CTradeExecutor"
+    participant VSL as "CVirtualStopManager"
+    participant Store as "CStateStore"
 
-    MT4->>EA: OnTick - position closed at a loss
-    EA->>Mart: OnPositionClosed(profit < 0)
-    Mart->>Mart: step < max? arm await-reentry, record loss time
-    EA->>Store: Save() - pending re-entry persisted
+    MT4->>EA: Losing position closes
+    EA->>Mart: OnPositionClosed(loss, close price)
+    Mart->>Mart: Arm pending re-entry and record loss context
+    EA->>Store: Save pending recovery state
+    MT4->>EA: Later eligible tick
+    EA->>Mart: ReentryAllowed(context)
+    Mart->>Mart: Gate 1 - idle state
+    Mart->>Mart: Gate 2 - consecutive-loss pause
+    Mart->>Mart: Gate 3 - EffectiveMaxSteps ATR cap
+    Mart->>Mart: Gate 4 - progressive cooldown
+    Mart->>Mart: Gate 5 - new-bar or ATR price spacing
+    Mart->>Mart: Gate 6 - mode-aware ADX threshold
+    Mart->>Mart: Gate 7 - reversal confirmation
+    Mart-->>EA: Allowed or first block reason
+    alt Re-entry allowed
+        EA->>Mart: ReentryDir() and ReentryLots()
+        Mart-->>EA: Direction and scheduled lot size
+        EA->>Risk: Resolve()
+        Risk-->>EA: ATR-based trade parameters
+        EA->>Exec: Open(re-entry direction, lots, risk)
+        Exec->>MT4: OrderSend
+        MT4-->>Exec: ticket
+        Exec->>VSL: Register protection
+        EA->>Mart: OnReentry(direction, lots)
+        EA->>Store: Save()
+    else Re-entry blocked
+        EA->>EA: Show block reason and wait
+    end
+```
 
-    MT4->>EA: OnTick - later bars
-    EA->>Guard: Breached()?
-    Guard-->>EA: false
-    EA->>EA: session open, not paused, spread OK
-    EA->>Mart: ReentryAllowed(ctx) - centralized checks
-    Mart->>Mart: pause, ATR step cap, progressive cooldown,<br/>ATR spacing, ADX block, reversal confirmation
-    Mart-->>EA: true
-    EA->>EA: volume OK
-    EA->>Mart: ReentryDir(), ReentryLots(per-step multiplier)
-    EA->>Exec: Open(reDir, lots)
-    Exec->>MT4: OrderSend
-    MT4-->>Exec: ticket
-    Exec->>VSL: Register(ticket, ...)
-    EA->>Mart: OnReentry() - step++
-    EA->>Store: Save()
+### Auto-Calibration at Initialization
+
+```mermaid
+sequenceDiagram
+    participant MT4 as "MT4 OnInit"
+    participant EA as "CExpertAdvisor facade"
+    participant PPM as "CPpmEngine"
+    participant ATR as "M1 ATR indicator"
+    participant ADX as "M1 ADX indicator"
+    participant Mart as "CMartingaleController"
+    participant Log as "Experts log"
+
+    MT4->>EA: OnInitHandler()
+    EA->>Mart: Init(manual thresholds)
+    EA->>PPM: VerifyIndicator()
+    PPM-->>EA: Indicator verification succeeds
+    alt InpAutoCalibrateMartAtr and at least 60 bars
+        loop Last min(500, Bars minus 1) closed M1 bars
+            EA->>ATR: iATR(period, shift) divided by PipSize()
+            ATR-->>EA: ATR pips
+            EA->>ADX: iADX(period, PRICE_CLOSE, MODE_MAIN, shift)
+            ADX-->>EA: ADX value
+        end
+        EA->>EA: Sort samples and select ATR p50 and p85
+        EA->>EA: Select ADX p60 for SAME or p40 for REVERSE
+        EA->>Mart: SetAtrThresholds(low pips, high pips)
+        EA->>Log: Print applied ATR thresholds and non-applied ADX suggestion
+    else Calibration unavailable
+        EA->>Log: Warn and keep manual ATR thresholds
+    end
 ```
 
 ### Equity Protection Trigger Sequence
 
 ```mermaid
 sequenceDiagram
-    participant MT4
-    participant EA as CExpertAdvisor
-    participant Guard as CEquityGuard
-    participant Exec as CTradeExecutor
-    participant Mart as CMartingaleController
-    participant Clock as CSessionClock
-    participant Store as CStateStore
+    participant MT4 as "MT4 runtime"
+    participant EA as "CExpertAdvisor facade"
+    participant Guard as "CEquityGuard"
+    participant Exec as "CTradeExecutor"
+    participant Mart as "CMartingaleController"
+    participant Clock as "CSessionClock"
+    participant Store as "CStateStore"
 
     MT4->>EA: OnTick - position open, equity falling
     EA->>Guard: Breached()?
@@ -452,12 +499,12 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant MT4
-    participant EA as CExpertAdvisor
-    participant Store as CStateStore
-    participant Guard as CEquityGuard
-    participant Mart as CMartingaleController
-    participant VSL as CVirtualStopManager
+    participant MT4 as "MT4 runtime"
+    participant EA as "CExpertAdvisor facade"
+    participant Store as "CStateStore"
+    participant Guard as "CEquityGuard"
+    participant Mart as "CMartingaleController"
+    participant VSL as "CVirtualStopManager"
 
     MT4->>EA: OnInit after restart
     EA->>Store: Load()
@@ -482,7 +529,7 @@ sequenceDiagram
 
 Two event handlers drive the EA:
 
-- **`OnTimer()`** (every `InpSampleMs`, default 50 ms): samples Ask into a circular buffer, updates the rolling average spread (`g_spread_ema`), recomputes the range and PPM, manages trailing stops, enforces the virtual SL, and refreshes the on-chart panel.
+- **`OnTimer()`** (every `InpSampleMs`, default 50 ms): samples Ask into a circular buffer, updates the component-owned rolling spread EMA, recomputes the range and PPM, manages trailing stops, enforces the virtual SL, and refreshes the on-chart panel.
 - **`OnTick()`** (each new M1 bar): recognizes the closed candle, updates cycle state (detecting closed positions and arming martingale if needed), and evaluates entries.
 
 ### Engines
@@ -540,7 +587,7 @@ Every re-entry must pass **all** of these, evaluated inside `ReentryAllowed()`:
 | # | Check | Input(s) | Behavior |
 |---|---|---|---|
 | 1 | Consecutive-loss pause | `InpMaxConsecLosses`, `InpConsecLossPauseMin` | N losses in a row (across cycles, reset on any win) pause **all** entries — fresh and martingale — for the configured minutes. Persisted across restarts. |
-| 2 | ATR-adaptive step cap | `InpMartAtrLowPips`, `InpMartAtrHighPips` | High volatility reduces exposure: full steps at low ATR, one fewer at medium, only 2 above the high threshold. `0` disables. |
+| 2 | ATR-adaptive step cap | `InpMartAtrLowPips`, `InpMartAtrHighPips`, `InpAutoCalibrateMartAtr` | High volatility reduces exposure: full steps at low ATR, one fewer at medium, only 2 above the high threshold. Auto-calibration overrides the manual thresholds in controller state with M1 ATR p50/p85 values. |
 | 3 | Progressive cooldown | `InpMartCooldownSchedule` (default `0,1,2,3,5`) | Per-step bar cooldown — slows down only as risk increases. Empty schedule falls back to fixed `InpMartCooldownBars`. |
 | 4 | New-bar / ATR spacing floor | `InpMartMinAtrDist` (default 0.5) | Even at a 0-bar cooldown, a same-bar re-entry requires price to have moved >= ATR x factor away from the losing close. Set to 0 to force a new M1 bar instead. Prevents rapid-fire entries within 2 pips. |
 | 5 | ADX trend gate (mode-aware, v10.11) | `InpMartMaxADX` (default 30), `InpMartADXPeriod` | SAME: no re-entry while ADX(M1) is **above** the limit (don't average against a trend). REVERSE: no re-entry while ADX is **below** the limit (only reverse *with* a confirmed trend). `0` or ADX unavailable disables. |
@@ -626,38 +673,34 @@ The file starts with a format tag; state files from v9 or older fail the tag che
 1. Copy `oneminuteman.mq4` into `MQL4/Experts/`.
 2. Ensure the built-in **ZigZag** indicator is available in `MQL4/Indicators/`.
 3. Restart MetaTrader 4 or refresh the Navigator, then compile in MetaEditor.
-4. Attach to any chart (analysis is forced to M1) and allow automated trading.
+4. Attach the EA to an **M1 chart** and enable MetaTrader's **AutoTrading** button.
 5. Keep `InpEnableTrading = false` until you have demo-tested.
 
 ---
 
 ## User Guide
 
-### Quick Start (5 minutes)
+### Quick Start
 
-1. **Install** (see [Installation](#installation)) and compile in MetaEditor — expect **0 errors, 0 warnings**.
-2. Attach to an **M1 chart** of a major pair on a **demo account**. The EA forces M1 analysis regardless of chart timeframe.
-3. Leave every input at its default. Defaults are the tested, protected configuration.
-4. Watch the on-chart panel for one full session with `InpEnableTrading = false` — confirm PPM, candle patterns, and spread readings look sane for your broker.
-5. Set `InpEnableTrading = true` and let it run on demo for **at least 2–4 weeks** before considering anything else.
+1. Copy `oneminuteman.mq4` to `MQL4/Experts/`, refresh the Navigator, and compile it in MetaEditor.
+2. Attach the EA to an **M1 chart on a demo account**. The strategy also requests M1 data explicitly.
+3. Enable MetaTrader's **AutoTrading** control, but initially leave `InpEnableTrading = false`.
+4. Review at minimum `InpBaseLots`, `InpMagic`, session hours, equity limits, martingale mode, maximum steps, multiplier/cooldown schedules, ADX gate, and ATR-adaptive thresholds.
+5. Observe the panel and Experts log for a full session. Confirm spread, PPM, candle, ATR, and volume behavior is plausible for the broker and symbol.
+6. Optionally set `InpAutoCalibrateMartAtr = true`, then reinitialize the EA. With at least 60 bars, initialization samples up to 500 closed M1 bars.
+7. Read the Experts log line beginning `Auto-calibrate:`. The reported ATR low/high thresholds are **applied to the running controller**; the reported `InpMartMaxADX` is **not applied**.
+8. After demo validation, copy the suggested ADX value into `InpMartMaxADX` manually if it suits the selected martingale mode. SAME uses the ADX 60th percentile; REVERSE uses the 40th percentile.
+9. Only then set `InpEnableTrading = true`, and continue demo testing for at least 2–4 weeks before considering live use.
+
+> Auto-calibration is a heuristic, not an optimization or safety guarantee. Recalibrate and validate per symbol, broker, and market regime on demo.
 
 ### Reading the On-Chart Panel
 
-```
-=== OneMinuteMan v10.10 ===
-Symbol:EURUSD  Engines:M1 (forced)  Chart:M1
---- Range ---            <- rolling tick High/Low window
---- Candle ---           <- last classified pattern + trend
-PPM:1.25  Zone:MEDIUM    <- market efficiency (ZigZag pips/minute)
---- Trade ---
-Trading:ON  Spread:12/32  Equity:$1000.00  DD:1.20%
-Open:1  Mart:2/5 (SAME) [AWAIT]
-ConsecLosses:2  Block:ATR price spacing
-Session: OPEN  HideSL:ON  VSLs:1
-```
-
 | Line | Meaning |
 |---|---|
+| Range and Candle | Rolling sampled high/low plus the latest closed M1 candle classification |
+| PPM and Zone | ZigZag-derived pips-per-minute efficiency and its LOW/MEDIUM/HIGH classification |
+| Trading and Spread | EA trade switch plus current/adaptive-limit spread in points |
 | `Spread:12/32` | Current spread / adaptive limit (points). Entries blocked above the limit |
 | `Mart:2/5 (SAME) [AWAIT]` | Martingale step 2 of max 5, same-direction mode, re-entry armed |
 | `ConsecLosses:2` | Cross-cycle loss streak. At `InpMaxConsecLosses` (default 3) **all** entries pause |
@@ -795,6 +838,7 @@ Worst-case cumulative exposure with fixed 2.0 multiplier: 3× base lots at 1 ste
 | `InpMartConfirm` | `EITHER` | Reversal confirmation: `NONE` / `CANDLE` / `PPM` / `EITHER` / `BOTH` |
 | `InpMartAtrLowPips` | 0 | ATR-adaptive steps: full steps at/below this ATR (0 = off) |
 | `InpMartAtrHighPips` | 0 | ATR-adaptive steps: only 2 steps above this ATR (0 = off) |
+| `InpAutoCalibrateMartAtr` | false | Apply ATR p50/p85 thresholds from up to 500 closed M1 bars and print a non-applied ADX suggestion |
 
 ### Equity Protection
 | Input | Default | Description |
@@ -825,10 +869,12 @@ Worst-case cumulative exposure with fixed 2.0 multiplier: 3× base lots at 1 ste
 
 ## Changelog
 
-### v10.11 — Mode-Aware ADX Trend Gate
+### v10.11 — Mode-Aware ADX Trend Gate and Auto-Calibration
 
 - **ADX gate is now direction-aware.** SAME-direction martingale keeps the original behavior (block when ADX > `InpMartMaxADX` — never average against a strong trend). REVERSE-direction martingale inverts the check (block when ADX < `InpMartMaxADX` — only reverse *with* a confirmed trend), fixing the design gap where the block starved reverse recovery of exactly its best moments.
 - **Fail-open on data errors:** the gate is skipped when ADX is unavailable (`iADX` error returns 0), so a data failure can never dead-lock REVERSE re-entries.
+- **Optional init-time calibration:** `InpAutoCalibrateMartAtr` applies recent closed-M1 ATR p50/p85 values as the controller's low/high adaptive-step thresholds.
+- **ADX remains manual:** calibration prints an ADX p60 suggestion for SAME mode or p40 for REVERSE mode, but never changes `InpMartMaxADX`.
 - New panel block reason: `ADX too low (reverse needs trend)`.
 
 ### v10.10 — Consecutive-Loss Protection
