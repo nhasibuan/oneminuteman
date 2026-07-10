@@ -141,6 +141,7 @@ input double InpMartMinAtrDist       = 0.5;  // Same-bar re-entry needs price mo
 input ENUM_MART_CONFIRM InpMartConfirm = MART_CONFIRM_EITHER; // Reversal confirmation before each step
 input int    InpMartAtrLowPips       = 0;    // ATR-adaptive steps: full steps at/below this ATR pips (0 = off)
 input int    InpMartAtrHighPips      = 0;    // ATR-adaptive steps: only 2 steps above this ATR pips (0 = off)
+input bool   InpAutoCalibrateMartAtr = false; // Auto-derive ATR low/high pip thresholds + suggest ADX from recent M1 bars
 
 //--- Equity Protection
 input double InpMaxDrawdownPct      = 10.0;  // Halt if daily drawdown >= 10%
@@ -948,6 +949,11 @@ public:
       ResetCycle();
    }
 
+   void SetAtrThresholds(int lowPips, int highPips) {
+      m_atr_low_pips = lowPips;
+      m_atr_high_pips = highPips;
+   }
+
    void ResetCycle() {
       m_step = 0;
       m_await_reentry = false;
@@ -1009,7 +1015,8 @@ public:
       return m_cooldown_bars;
    }
 
-   // ATR-adaptive max steps: high volatility -> fewer rungs
+   // ATR-adaptive max steps: thresholds may be calibrated from live M1 ATR
+   // percentiles rather than hardcoded, and remain heuristic until demo-validated.
    int EffectiveMaxSteps(double atrPips) {
       if(m_atr_low_pips <= 0 || m_atr_high_pips <= 0 || atrPips <= 0.0) return m_max_steps;
       if(atrPips <= m_atr_low_pips)  return m_max_steps;
@@ -1410,7 +1417,7 @@ private:
    }
 
    void UpdateComment() {
-      string msg = "=== OneMinuteMan v10.10 ===\n";
+      string msg = "=== OneMinuteMan v10.11 ===\n";
       msg += StringFormat("Symbol:%-6s  Engines:M1 (forced)  Chart:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n", m_range.High(), m_range.Low(), m_range.Range());
@@ -1481,6 +1488,58 @@ public:
          return INIT_FAILED;
       }
 
+      // These thresholds are calibrated from live M1 ATR percentiles, not
+      // hardcoded; ATR is applied, while ADX remains a demo-validation suggestion.
+      if(InpAutoCalibrateMartAtr) {
+         if(Bars < 60) {
+            Print("Auto-calibrate warning: fewer than 60 bars available; keeping manual ATR thresholds.");
+         } else {
+            int sampleCount = (int)MathMin(500, Bars - 1);
+            double pipSize = PipSize();
+            double atrValues[];
+            double adxValues[];
+            ArrayResize(atrValues, sampleCount);
+            ArrayResize(adxValues, sampleCount);
+            int atrCount = 0;
+            int adxCount = 0;
+
+            for(int i = 1; i <= sampleCount; i++) {
+               double atrPips = iATR(Symbol(), PERIOD_M1, InpAtrPeriod, i) / pipSize;
+               if(atrPips > 0.0) atrValues[atrCount++] = atrPips;
+
+               double adx = iADX(Symbol(), PERIOD_M1, InpMartADXPeriod,
+                                 PRICE_CLOSE, MODE_MAIN, i);
+               if(adx > 0.0) adxValues[adxCount++] = adx;
+            }
+
+            if(atrCount < 60) {
+               Print("Auto-calibrate warning: fewer than 60 valid M1 ATR samples; keeping manual ATR thresholds.");
+            } else {
+               ArrayResize(atrValues, atrCount);
+               ArraySort(atrValues, WHOLE_ARRAY, 0, MODE_ASCEND);
+               int lowIndex = (int)MathRound((atrCount - 1) * 0.50);
+               int highIndex = (int)MathRound((atrCount - 1) * 0.85);
+               int lowPips = (int)MathRound(atrValues[lowIndex]);
+               int highPips = (int)MathRound(atrValues[highIndex]);
+               if(highPips < lowPips) highPips = lowPips;
+               m_mart.SetAtrThresholds(lowPips, highPips);
+
+               double adxSuggest = 0.0;
+               if(adxCount > 0) {
+                  ArrayResize(adxValues, adxCount);
+                  ArraySort(adxValues, WHOLE_ARRAY, 0, MODE_ASCEND);
+                  double percentile = (InpMartMode == MART_SAME_DIRECTION) ? 0.60 : 0.40;
+                  int adxIndex = (int)MathRound((adxCount - 1) * percentile);
+                  adxSuggest = NormalizeDouble(adxValues[adxIndex], 1);
+               }
+
+               Print("Auto-calibrate: ATR thresholds APPLIED low=", lowPips,
+                     " high=", highPips, " pips; suggested InpMartMaxADX=",
+                     adxSuggest, " (not applied; set manually after demo validation)");
+            }
+         }
+      }
+
       // Restore persisted state (martingale cycle, halt, day baseline, VSLs)
       bool   halted = false;
       datetime haltUntil = 0;
@@ -1508,7 +1567,7 @@ public:
 
       if(!EventSetMillisecondTimer(InpSampleMs)) { Print("Error: Timer failed"); return INIT_FAILED; }
       m_initialized = true;
-      Print("OneMinuteMan v10.10 initialized successfully.");
+      Print("OneMinuteMan v10.11 initialized successfully.");
       return INIT_SUCCEEDED;
    }
 
